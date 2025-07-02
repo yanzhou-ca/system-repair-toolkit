@@ -1,7 +1,7 @@
 # System Repair Toolkit
 
 A comprehensive Windows system repair and cleanup utility with a user-friendly graphical interface.
-![Screenshot](https://github.com/user-attachments/assets/4b4009bc-0918-47a3-96f7-6998a0326895)
+![Screenshot](https://github.com/yanzhou-ca/system-repair-toolkit/blob/main/Screenshot.png?raw=true)
 
 ## What It Does
 
