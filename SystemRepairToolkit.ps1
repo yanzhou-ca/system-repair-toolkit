@@ -1,6 +1,4 @@
 #requires -Version 5.0
-#requires -RunAsAdministrator
-
 <#
 .SYNOPSIS
     A Windows Forms-based GUI toolkit for performing common system repair and optimization tasks,
@@ -11,25 +9,22 @@
     progress updates to the user without freezing the UI. All actions are logged to a file on
     the user's Desktop for easy troubleshooting.
 .NOTES
-    Version: 4.0 (Fully Revised - Complete Feature Parity)
+    Version: 5.0
     Author: Yan Zhou
     Requirements: PowerShell 5.0+, Windows 10/11, Administrator privileges for full functionality.
-    
     ==============================
-    SYSTEM REPAIR TOOLKIT v4.0
+    SYSTEM REPAIR TOOLKIT v5.0
     ==============================
-    Major Changes in v4.0:
-    - Fixed all automatic variable usage ($PID, $PSVersionTable, $matches)
-    - Removed all unused variables
-    - All functions use approved verbs from Get-Verb
-    - Maintained ALL original functionality
-    - Enhanced error handling and thread safety
-    - Optimized performance while keeping all features
 #>
-
 #region 1. Script Initialization - Assembly Loading and PowerShell Requirements
 # Load required .NET assemblies for Windows Forms GUI
 try {
+    # Moved Add-Type inside GUI init in practice, but since GUI requires WinForms,
+    # we keep here but add early interactivity check
+    if (-not [System.Environment]::UserInteractive) {
+        Write-Error "This script requires an interactive desktop session (e.g., not Server Core or PowerShell remoting)."
+        exit 1
+    }
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
     Add-Type -AssemblyName System.Drawing -ErrorAction Stop
 } catch {
@@ -37,14 +32,12 @@ try {
     Write-Error "Ensure .NET Framework is properly installed"
     exit 1
 }
-
 # Initialize critical state flags early
 $script:isInitialized = $false
 $script:lastUiUpdate = [DateTime]::MinValue
 $script:progressCommunicationFailures = 0
 $script:disposedObjects = [System.Collections.Generic.HashSet[object]]::new()
 #endregion
-
 #region 2. Global Configuration - Constants and Settings
 $script:CONSTANTS = @{
     # Timer and timeout settings
@@ -54,14 +47,12 @@ $script:CONSTANTS = @{
     MAX_ESTIMATED_PROGRESS        = 95      # Maximum estimated progress percentage
     UI_UPDATE_THROTTLE_MS         = 250     # UI update throttling
     PROGRESS_COMM_FAILURE_LIMIT   = 8       # Max communication failures before fallback
-    
     # Cleanup configuration
     SAGESET_VALUE                 = 64      # Registry sageset value for cleanup
     LOG_FILENAME                  = "SystemRepairLog.txt"
     LOG_MAX_SIZE_MB               = 10      # Maximum log file size before rotation
     COMMUNICATION_PREFIX          = "RepairToolkit"  # Prefix for IPC files
 }
-
 # Windows 11 Fluent Design constants
 $script:FLUENT_DESIGN = @{
     # Windows 11 Official Colors
@@ -83,7 +74,6 @@ $script:FLUENT_DESIGN = @{
         BORDER_LIGHT        = [System.Drawing.Color]::FromArgb(225, 225, 225)  # #E1E1E1
         BORDER_MEDIUM       = [System.Drawing.Color]::FromArgb(200, 198, 196)  # #C8C6C4
     }
-    
     # 8px Grid System (Windows 11 standard)
     Spacing = @{
         GRID_UNIT    = 8      # Base unit
@@ -94,7 +84,6 @@ $script:FLUENT_DESIGN = @{
         XLARGE       = 32     # 4x
         XXLARGE      = 48     # 6x
     }
-    
     # Typography Scale
     Typography = @{
         TITLE_SIZE       = 20    # Large titles
@@ -103,7 +92,6 @@ $script:FLUENT_DESIGN = @{
         CAPTION_SIZE     = 12    # Small text
         BUTTON_SIZE      = 14    # Button text
     }
-    
     # Button Dimensions
     ButtonDimensions = @{
         MAIN_WIDTH   = 350
@@ -113,33 +101,30 @@ $script:FLUENT_DESIGN = @{
     }
 }
 #endregion
-
 #region 3. State Management - Script Variables and Runtime State
 # Job management variables
 $script:currentRepairJob = $null                    # Current running background job
 $script:progressUpdateTimer = $null                 # Timer for progress updates
 $script:operationStartTime = [DateTime]::MinValue  # Start time of current operation
-$script:timerLock = [System.Threading.Mutex]::new($false, "RepairToolkitTimer")
+$script:uiDelayTimer = $null                        # One-shot timer for UI state transitions
+# Use local lock object instead of system-wide mutex
+$script:timerLock = [object]::new()
 $script:currentJobId = [String]::Empty              # Unique ID for current job
 $script:capturedJobResult = $null                   # Cached job result
 $script:jobCollection = [System.Collections.Concurrent.ConcurrentDictionary[string, object]]::new()
-
 # Logging state
 $script:logPath = [String]::Empty                   # Full path to log file
 $script:lastLoggedProgress = [String]::Empty       # Last logged progress message
 $script:lastLoggedPercent = -1                      # Last logged percentage
 $script:lastProgressLogTime = [DateTime]::MinValue # Last time progress was logged
 $script:progressMessageCount = 0                    # Total progress messages
-
 # Progress tracking
 $script:fallbackProgressEnabled = $false            # Whether to use estimated progress
 $script:lastProgressUpdate = [DateTime]::MinValue  # Last actual progress update
 $script:lastFallbackLogTime = [DateTime]::MinValue # Last fallback progress log
-
 # Output processing state
 $script:lastOutputCount = 0                         # Track processed output count for timer
 $script:lastProcessedOutputCount = 0                # Track processed output count for receive function
-
 # UI elements (will be initialized in GUI region)
 $script:form = $null
 $script:titleLabel = $null
@@ -156,7 +141,6 @@ $script:closeButton = $null
 $script:toolTip = $null
 $script:titleFont = $null
 $script:secondaryFont = $null
-
 # Initialize logging early to capture all events
 function Initialize-ScriptLogging {
     try {
@@ -164,22 +148,20 @@ function Initialize-ScriptLogging {
         if ([string]::IsNullOrEmpty($desktopPath)) {
             $desktopPath = Join-Path $env:USERPROFILE "Desktop"
         }
-        
+        if (-not (Test-Path $desktopPath)) {
+            $desktopPath = $env:TEMP
+        }
         $script:logPath = [System.IO.Path]::Combine($desktopPath, $script:CONSTANTS.LOG_FILENAME)
-        
         # Check if log exists and rotate if needed
         if (Test-Path $script:logPath) {
             try {
                 $logFile = Get-Item $script:logPath -ErrorAction Stop
                 $logSizeMB = [Math]::Round($logFile.Length / 1MB, 2)
-                
                 if ($logFile.Length -gt ($script:CONSTANTS.LOG_MAX_SIZE_MB * 1MB)) {
                     $backupPath = [System.IO.Path]::Combine($desktopPath, "SystemRepairLog_backup.txt")
-                    
                     if (Test-Path $backupPath) {
                         Remove-Item $backupPath -Force -ErrorAction SilentlyContinue
                     }
-                    
                     Move-Item $script:logPath $backupPath -Force -ErrorAction SilentlyContinue
                     Write-Host "Log file rotated (was $logSizeMB MB)" -ForegroundColor Yellow
                 }
@@ -188,15 +170,13 @@ function Initialize-ScriptLogging {
                 Write-Warning "Could not check log file size: $($_.Exception.Message)"
             }
         }
-        
-        # Write session header - FIXED: No automatic variables
+        # Write session header - No automatic variables
         $separator = "=" * 80
         $adminStatus = if (Test-IsAdministrator) { 'Yes' } else { 'No' }
-        # FIXED: Replaced $PSVersionTable with $Host.Version
+        # Replaced $PSVersionTable with $Host.Version
         $psVersion = $Host.Version.ToString()
-        # FIXED: Replaced $PID with Process.GetCurrentProcess()
+        # Replaced $PID with Process.GetCurrentProcess()
         $processId = [System.Diagnostics.Process]::GetCurrentProcess().Id
-        
         $header = @"
 $separator
 SYSTEM REPAIR TOOLKIT - SESSION LOG
@@ -210,24 +190,19 @@ Process ID: $processId
 Log Path: $script:logPath
 $separator
 "@
-        
         Add-Content -Path $script:logPath -Value $header -Encoding UTF8
         $script:isInitialized = $true
-        
         # Log successful initialization
         Write-SimpleLog -Message "System Repair Toolkit session started"
-        
     }
     catch {
         Write-Warning "Failed to initialize repair log: $($_.Exception.Message)"
         $script:isInitialized = $false
     }
 }
-
 # Simple logging function for early initialization
 function Write-SimpleLog {
     param([string]$Message)
-    
     if ($script:isInitialized -and -not [string]::IsNullOrEmpty($script:logPath)) {
         try {
             $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -239,7 +214,6 @@ function Write-SimpleLog {
         }
     }
 }
-
 # Helper function for early initialization
 function Test-IsAdministrator {
     try {
@@ -247,7 +221,6 @@ function Test-IsAdministrator {
         if ($null -eq $identity) {
             return $false
         }
-        
         $principal = New-Object System.Security.Principal.WindowsPrincipal($identity)
         return $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
     }
@@ -255,11 +228,9 @@ function Test-IsAdministrator {
         return $false
     }
 }
-
 # Initialize logging immediately
 Initialize-ScriptLogging
 #endregion
-
 #region 4. Logging Infrastructure - Comprehensive Logging System
 # Logging configuration with categories and operations
 $script:LOG_CONFIG = @{
@@ -288,30 +259,24 @@ $script:LOG_CONFIG = @{
         CLEANUP = "Cleaning temporary files and optimizing system"
     }
 }
-
 function Write-RepairLog {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true, Position = 0)]
         [ValidateNotNullOrEmpty()]
         [string]$Message,
-        
         [Parameter(Position = 1)]
         [ValidateSet("INFO", "OPERATION", "PROGRESS", "SUCCESS", "WARNING", "ERROR", "USER", "SYSTEM", "JOB", "DEBUG")]
         [string]$Category = "INFO",
-        
         [Parameter(Position = 2)]
         [ValidateSet("DISM", "SFC", "CLEANUP", "TOOLKIT", "JOB")]
         [string]$Operation = "TOOLKIT",
-        
         [switch]$IncludeInConsole
     )
-    
     # Early validation
     if (-not $script:isInitialized -or [string]::IsNullOrEmpty($script:logPath)) {
         return
     }
-    
     try {
         # Simple message cleaning
         $cleanMessage = if ([string]::IsNullOrWhiteSpace($Message)) { 
@@ -319,46 +284,30 @@ function Write-RepairLog {
         } else { 
             $Message.Trim() 
         }
-        
         # Truncate very long messages
         if ($cleanMessage.Length -gt 1000) {
             $cleanMessage = $cleanMessage.Substring(0, 997) + "..."
         }
-        
         # Get category and operation info
         $categoryInfo = $script:LOG_CONFIG.Categories[$Category]
         $operationName = $script:LOG_CONFIG.Operations[$Operation]
-        
         # Simple log entry format
         $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
         $logEntry = "[$timestamp] [$($categoryInfo.Display)] [$operationName] $cleanMessage"
-        
-        # Simplified file writing without complex locking
+        # Use thread-safe queue or mutex per write
+        $logLock = [System.Threading.Mutex]::new($false, "RepairToolkitLogWrite")
         try {
-            # Use a simple approach with retry
-            $attempts = 0
-            $maxAttempts = 2
-            
-            do {
-                try {
-                    [System.IO.File]::AppendAllText($script:logPath, "$logEntry`r`n", [System.Text.Encoding]::UTF8)
-                    break
-                }
-                catch {
-                    $attempts++
-                    if ($attempts -lt $maxAttempts) {
-                        Start-Sleep -Milliseconds 10
-                    }
-                }
-            } while ($attempts -lt $maxAttempts)
-        }
-        catch {
-            # Final fallback - write to console
-            if ($IncludeInConsole) {
-                Write-Host $logEntry -ForegroundColor $categoryInfo.Color
+            $acquired = $logLock.WaitOne(2000)
+            if ($acquired) {
+                [System.IO.File]::AppendAllText($script:logPath, "$logEntry`r`n", [System.Text.Encoding]::UTF8)
             }
         }
-        
+        finally {
+            if ($acquired) {
+                $logLock.ReleaseMutex()
+            }
+            $logLock.Dispose()
+        }
         # Console output if requested
         if ($IncludeInConsole) {
             try {
@@ -373,7 +322,19 @@ function Write-RepairLog {
         # Simplified fallback logging
         try {
             $fallbackEntry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [ERR!] [TOOLKIT] Logging failed: $($_.Exception.Message)"
-            [System.IO.File]::AppendAllText($script:logPath, "$fallbackEntry`r`n", [System.Text.Encoding]::UTF8)
+            $logLock = [System.Threading.Mutex]::new($false, "RepairToolkitLogWrite")
+            try {
+                $acquired = $logLock.WaitOne(1000)
+                if ($acquired) {
+                    [System.IO.File]::AppendAllText($script:logPath, "$fallbackEntry`r`n", [System.Text.Encoding]::UTF8)
+                }
+            }
+            finally {
+                if ($acquired) {
+                    $logLock.ReleaseMutex()
+                }
+                $logLock.Dispose()
+            }
         }
         catch {
             # Final fallback
@@ -383,18 +344,15 @@ function Write-RepairLog {
         }
     }
 }
-
 function Write-OperationStart {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [ValidateSet("DISM", "SFC", "CLEANUP")]
         [string]$OperationType,
-        
         [ValidateNotNullOrEmpty()]
         [string]$Description = ""
     )
-    
     try {
         if ([string]::IsNullOrEmpty($Description)) {
             $Description = $script:LOG_CONFIG.OperationDescriptions[$OperationType]
@@ -405,44 +363,34 @@ function Write-OperationStart {
         Write-RepairLog -Message "Error logging operation start: $($_.Exception.Message)" -Category "ERROR"
     }
 }
-
 function Write-OperationEnd {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [ValidateSet("DISM", "SFC", "CLEANUP")]
         [string]$OperationType,
-        
         [Parameter()]
         [TimeSpan]$Duration = [TimeSpan]::Zero,
-        
         [Parameter()]
         [bool]$Success = $true,
-        
         [Parameter()]
         [int]$ExitCode = 0,
-        
         [Parameter()]
         [string]$AdditionalInfo = ""
     )
-    
     try {
         $durationText = if ($Duration -ne [TimeSpan]::Zero) { 
-            "in {0:mm\:ss} (mm:ss)" -f $Duration 
+            "in {0:mm\:ss}" -f $Duration 
         }
         else { 
             "duration unknown" 
         }
-        
         $resultText = if ($Success) { "COMPLETED SUCCESSFULLY" } else { "COMPLETED WITH ISSUES" }
         $category = if ($Success) { "SUCCESS" } else { "WARNING" }
-        
         Write-RepairLog -Message "=== $resultText $($script:LOG_CONFIG.OperationDescriptions[$OperationType]) $durationText ===" -Category $category -Operation $OperationType
-        
         if ($ExitCode -ne 0) {
             Write-RepairLog -Message "Exit code: $ExitCode" -Category "INFO" -Operation $OperationType
         }
-        
         if (-not [string]::IsNullOrEmpty($AdditionalInfo)) {
             Write-RepairLog -Message "Additional info: $AdditionalInfo" -Category "INFO" -Operation $OperationType
         }
@@ -451,7 +399,6 @@ function Write-OperationEnd {
         Write-RepairLog -Message "Error logging operation end: $($_.Exception.Message)" -Category "ERROR"
     }
 }
-
 function Initialize-RepairLog {
     # This is now called from Initialize-ScriptLogging
     # Kept for compatibility but now just writes a log entry
@@ -462,11 +409,9 @@ function Initialize-RepairLog {
         Initialize-ScriptLogging
     }
 }
-
 function Close-RepairLog {
     [CmdletBinding()]
     param()
-    
     try {
         if ($script:isInitialized -and -not [string]::IsNullOrEmpty($script:logPath)) {
             $separator = "=" * 80
@@ -478,7 +423,6 @@ Communication Failures: $script:progressCommunicationFailures
 $separator
 "@
             Write-RepairLog -Message "System Repair Toolkit session ending" -Category "SYSTEM"
-            
             # Direct write for footer to avoid recursion
             $logLock = [System.Threading.Mutex]::new($false, "RepairToolkitLog")
             try {
@@ -500,7 +444,6 @@ $separator
     }
 }
 #endregion
-
 #region 5. Core Utility Functions - Common Helper Functions
 function Confirm-AdminOrFail {
     [CmdletBinding()]
@@ -509,7 +452,6 @@ function Confirm-AdminOrFail {
         [ValidateNotNullOrEmpty()]
         [string]$OperationName
     )
-    
     if (-not (Test-IsAdministrator)) {
         $message = "$OperationName requires Administrator privileges. Please restart the toolkit as an Administrator."
         Show-WarningMessage -Message $message
@@ -518,36 +460,30 @@ function Confirm-AdminOrFail {
     }
     return $true
 }
-
 function Invoke-WithErrorHandling {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [ValidateNotNull()]
         [scriptblock]$ScriptBlock,
-        
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$OperationName,
-        
         [Parameter()]
         [bool]$ContinueOnError = $true
     )
-    
     try {
         return & $ScriptBlock
     }
     catch {
         $errorMessage = "Error in '$OperationName': $($_.Exception.Message)"
         Write-RepairLog -Message $errorMessage -Category 'ERROR' -Operation 'TOOLKIT'
-        
         if (-not $ContinueOnError) { 
             throw 
         }
         return $null
     }
 }
-
 function Show-InfoMessage {
     [CmdletBinding()]
     param(
@@ -566,7 +502,6 @@ function Show-InfoMessage {
     )
     
     try {
-        # Check if form exists and is not disposed
         if ($null -ne $script:form -and -not $script:form.IsDisposed) {
             return [System.Windows.Forms.MessageBox]::Show($script:form, $Message, $Title, $Buttons, $Icon)
         }
@@ -576,7 +511,6 @@ function Show-InfoMessage {
     }
     catch {
         Write-RepairLog -Message "Error showing message box: $($_.Exception.Message)" -Category "ERROR"
-        # Fallback to simple message box
         try {
             return [System.Windows.Forms.MessageBox]::Show($Message, $Title, $Buttons, $Icon)
         }
@@ -586,50 +520,40 @@ function Show-InfoMessage {
         }
     }
 }
-
 function Show-ErrorMessage { 
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$Message, 
-        
         [Parameter()]
         [string]$Title = "System Repair Toolkit - Error"
     )
-    
     Show-InfoMessage -Message $Message -Title $Title -Icon 'Error'
 }
-
 function Show-WarningMessage { 
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$Message, 
-        
         [Parameter()]
         [string]$Title = "System Repair Toolkit - Warning"
     )
-    
     Show-InfoMessage -Message $Message -Title $Title -Icon 'Warning'
 }
-
 function Show-QuestionMessage { 
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$Message, 
-        
         [Parameter()]
         [string]$Title = "System Repair Toolkit - Confirmation"
     )
-    
     Show-InfoMessage -Message $Message -Title $Title -Buttons 'YesNo' -Icon 'Question'
 }
 #endregion
-
 #region 6. Job Communication Functions - Inter-Process Communication
 function Set-JobCommunication {
     [CmdletBinding()]
@@ -637,29 +561,23 @@ function Set-JobCommunication {
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$JobId,
-        
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$Key,
-        
         [Parameter(Mandatory = $true)]
         [ValidateNotNull()]
         [string]$Value
     )
-    
     try {
         # Get safe temp path
         $userTempPath = [System.IO.Path]::GetTempPath()
-        
         # Sanitize inputs to prevent path injection
         $safeJobId = $JobId -replace '[^\w\-]', ''
         $safeKey = $Key -replace '[^\w\-]', ''
-        
-        # Build communication file path
-        $communicationPath = [System.IO.Path]::Combine($userTempPath, "$($script:CONSTANTS.COMMUNICATION_PREFIX)_${safeJobId}_${safeKey}.tmp")
-        
+        # Use random filename to prevent squatting
+        $randomName = [System.IO.Path]::GetRandomFileName()
+        $communicationPath = [System.IO.Path]::Combine($userTempPath, "$($script:CONSTANTS.COMMUNICATION_PREFIX)_${safeJobId}_${safeKey}_${randomName}.tmp")
         Write-RepairLog -Message "Creating communication file: $communicationPath" -Category "JOB"
-        
         # Thread-safe file writing
         $fileLock = [System.Threading.Mutex]::new($false, "RepairToolkit_${safeJobId}_${safeKey}")
         try {
@@ -667,7 +585,6 @@ function Set-JobCommunication {
             if ($acquired) {
                 # Write value to file
                 Set-Content -Path $communicationPath -Value $Value -Encoding UTF8 -Force
-                
                 # Verify file was created
                 if (Test-Path $communicationPath) {
                     $fileSize = (Get-Item $communicationPath).Length
@@ -692,51 +609,42 @@ function Set-JobCommunication {
         Write-RepairLog -Message "Failed to set job communication: $($_.Exception.Message)" -Category "ERROR"
     }
 }
-
 function Get-JobCommunication {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$JobId,
-        
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$Key,
-        
         [Parameter()]
         [ValidateRange(1, 3600)]
         [int]$TimeoutSeconds = 90
     )
-    
     try {
-        # Get safe temp path
         $userTempPath = [System.IO.Path]::GetTempPath()
-        
-        # Sanitize inputs
         $safeJobId = $JobId -replace '[^\w\-]', ''
         $safeKey = $Key -replace '[^\w\-]', ''
-        
-        # Build communication file path
-        $communicationPath = [System.IO.Path]::Combine($userTempPath, "$($script:CONSTANTS.COMMUNICATION_PREFIX)_${safeJobId}_${safeKey}.tmp")
-        
-        # Set timeout
+        # Use pattern with wildcard since filename is random
+        $pattern = "$($script:CONSTANTS.COMMUNICATION_PREFIX)_${safeJobId}_${safeKey}_*.tmp"
+        $files = Get-ChildItem -Path $userTempPath -Filter $pattern -ErrorAction SilentlyContinue
+        $communicationPath = if ($files) { $files[0].FullName } else { $null }
+        if (-not $communicationPath) {
+            Write-RepairLog -Message "No communication file found for pattern: $pattern" -Category "WARNING"
+            return $null
+        }
         $timeout = (Get-Date).AddSeconds($TimeoutSeconds)
         $checkCount = 0
-        
         Write-RepairLog -Message "Waiting for communication file: $communicationPath (timeout: $TimeoutSeconds seconds)" -Category "JOB"
-        
-        # Poll for file
         while ((Get-Date) -lt $timeout) {
             if (Test-Path $communicationPath) {
                 $fileLock = [System.Threading.Mutex]::new($false, "RepairToolkit_${safeJobId}_${safeKey}")
                 try {
                     $acquired = $fileLock.WaitOne(100)
                     if ($acquired) {
-                        # Read and delete file
                         $value = Get-Content $communicationPath -Raw -ErrorAction SilentlyContinue
                         Remove-Item $communicationPath -Force -ErrorAction SilentlyContinue
-                        
                         if ($null -ne $value) { 
                             Write-RepairLog -Message "Communication received: $Key = $($value.Trim())" -Category "JOB"
                             return $value.Trim() 
@@ -750,16 +658,12 @@ function Get-JobCommunication {
                     $fileLock.Dispose()
                 }
             }
-            
-            # Log periodic status
             $checkCount++
             if ($checkCount % 20 -eq 0) {
                 Write-RepairLog -Message "Still waiting for communication: $Key (check $checkCount)" -Category "JOB"
             }
-            
             Start-Sleep -Milliseconds 500
         }
-        
         Write-RepairLog -Message "Job communication timeout for key: $Key after $TimeoutSeconds seconds" -Category "WARNING"
         return $null
     }
@@ -768,30 +672,23 @@ function Get-JobCommunication {
         return $null
     }
 }
-
 function Clear-JobCommunicationFiles {
     [CmdletBinding()]
     param(
         [Parameter()]
         [string]$JobId = ""
     )
-    
     try {
         $userTempPath = [System.IO.Path]::GetTempPath()
-        
         if ([string]::IsNullOrEmpty($JobId)) {
-            # Clear all communication files
             $pattern = "$($script:CONSTANTS.COMMUNICATION_PREFIX)_*.tmp"
         }
         else {
-            # Clear specific job files
             $safeJobId = $JobId -replace '[^\w\-]', ''
             $pattern = "$($script:CONSTANTS.COMMUNICATION_PREFIX)_${safeJobId}_*.tmp"
         }
-        
         $files = Get-ChildItem -Path $userTempPath -Filter $pattern -ErrorAction SilentlyContinue
         $fileCount = 0
-        
         foreach ($file in $files) {
             try {
                 Remove-Item $file.FullName -Force -ErrorAction Stop
@@ -801,7 +698,6 @@ function Clear-JobCommunicationFiles {
                 Write-RepairLog -Message "Could not remove communication file: $($file.Name)" -Category "WARNING"
             }
         }
-        
         if ($fileCount -gt 0) {
             Write-RepairLog -Message "Cleared $fileCount communication files" -Category "JOB"
         }
@@ -811,23 +707,19 @@ function Clear-JobCommunicationFiles {
     }
 }
 #endregion
-
 #region 7. Command Runner ScriptBlock - DISM and SFC Execution
 $script:commandRunnerScriptBlock = {
     param(
         [string]$ExecutablePath, 
         [string]$Arguments
     )
-    
     $jobStartTime = Get-Date
     $lastProgressPercent = 0
     $outputBuffer = [System.Collections.Generic.List[string]]::new()
     $lastRealProgress = Get-Date  # Track when we last got real progress
-    
     # Configure timeouts based on executable type
     $progressTimeoutSeconds = 600   # Default 10 minutes
     $estimateProgressAfter = 120    # Default 2 minutes
-    
     if ($ExecutablePath -like "*DISM.exe*") {
         # DISM can go silent for long periods during component store operations
         $progressTimeoutSeconds = 1800  # 30 minutes
@@ -838,76 +730,61 @@ $script:commandRunnerScriptBlock = {
         $progressTimeoutSeconds = 1200  # 20 minutes
         $estimateProgressAfter = 180    # 3 minutes
     }
-    
     function Get-CleanOutputLine {
         param([string]$RawLine)
-        
         if ([string]::IsNullOrWhiteSpace($RawLine)) { 
             return $null 
         }
-        
         $cleanLine = $RawLine -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]+', '' -replace '\s+', ' '
         $cleanLine = $cleanLine.Trim()
-        
-        if ($cleanLine.Length -lt 2 -or $cleanLine.Length -gt 500) {
+        # Increase limit to 4096
+        if ($cleanLine.Length -lt 2 -or $cleanLine.Length -gt 4096) {
             return $null
         }
-        
         return $cleanLine
     }
-    
     function Get-ProgressPercent {
         param([string]$Line)
-        
         # Enhanced pattern for DISM's unique format [===== 62.3% =====]
         # Try multiple patterns in order of specificity
-        
         # Pattern 1: DISM bracket format with equals signs
         $dismPattern = '\[=*\s*(\d{1,3})(?:\.\d+)?%\s*=*\]'
         $regexResult = [regex]::Match($Line, $dismPattern)
         if ($regexResult.Success) {
             return [int]$regexResult.Groups[1].Value
         }
-        
         # Pattern 2: Standard percentage with optional decimal
         $percentPattern = '(\d{1,3})(?:\.\d+)?%'
         $regexResult = [regex]::Match($Line, $percentPattern)
         if ($regexResult.Success) {
             return [int]$regexResult.Groups[1].Value
         }
-        
         # Pattern 3: Progress: prefix format
         $progressPattern = 'Progress:\s*(\d{1,3})'
         $regexResult = [regex]::Match($Line, $progressPattern)
         if ($regexResult.Success) {
             return [int]$regexResult.Groups[1].Value
         }
-        
         # Pattern 4: Simple bracket format
         $bracketPattern = '\[(\d{1,3})%\]'
         $regexResult = [regex]::Match($Line, $bracketPattern)
         if ($regexResult.Success) {
             return [int]$regexResult.Groups[1].Value
         }
-        
         # Pattern 5: Verification/Scan format (for SFC)
         $verifyPattern = 'Verification\s+(\d{1,3})%\s+complete'
         $regexResult = [regex]::Match($Line, $verifyPattern)
         if ($regexResult.Success) {
             return [int]$regexResult.Groups[1].Value
         }
-        
         return -1
     }
-    
     function Send-ProgressUpdate {
         param([string]$Message)
         Write-Output "PROGRESS_LINE:$Message"
     }
-    
     try {
         Send-ProgressUpdate "Starting $ExecutablePath with arguments: $Arguments"
-        
         # Create process with proper configuration
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo.FileName = $ExecutablePath
@@ -916,7 +793,6 @@ $script:commandRunnerScriptBlock = {
         $process.StartInfo.RedirectStandardOutput = $true
         $process.StartInfo.RedirectStandardError = $true
         $process.StartInfo.CreateNoWindow = $true
-        
         # Set proper encoding based on executable
         if ($ExecutablePath -like "*sfc.exe*") {
             try {
@@ -933,21 +809,17 @@ $script:commandRunnerScriptBlock = {
             $process.StartInfo.StandardOutputEncoding = [System.Text.Encoding]::UTF8
             $process.StartInfo.StandardErrorEncoding = [System.Text.Encoding]::UTF8
         }
-        
         # Start the process
         $processStarted = $process.Start()
         if (-not $processStarted) {
             throw "Failed to start process $ExecutablePath"
         }
-        
         Send-ProgressUpdate "Process started successfully with PID: $($process.Id)"
-        
         # Track progress updates
         $lastProgressUpdate = Get-Date
         $standardErrorText = ""
         $noProgressCounter = 0
         $lastEstimatedProgress = 0
-        
         # Read output in a simple loop
         while (-not $process.HasExited) {
             try {
@@ -955,10 +827,8 @@ $script:commandRunnerScriptBlock = {
                     $line = $process.StandardOutput.ReadLine()
                     if ($null -ne $line) {
                         $cleanLine = Get-CleanOutputLine -RawLine $line
-                        
                         if ($null -ne $cleanLine) {
                             $outputBuffer.Add($cleanLine)
-                            
                             # Extract percentage if present
                             $percent = Get-ProgressPercent -Line $cleanLine
                             if ($percent -ge 0 -and $percent -le 100) {
@@ -986,14 +856,11 @@ $script:commandRunnerScriptBlock = {
                     $timeSinceProgress = ((Get-Date) - $lastProgressUpdate).TotalSeconds
                     $timeSinceRealProgress = ((Get-Date) - $lastRealProgress).TotalSeconds
                     $elapsedTotal = ((Get-Date) - $jobStartTime).TotalSeconds
-                    
                     # Only provide estimated progress under specific conditions
                     if ($timeSinceRealProgress -gt $estimateProgressAfter -and 
                         $timeSinceProgress -gt 30 -and 
                         $elapsedTotal -lt $progressTimeoutSeconds) {
-                        
                         $noProgressCounter++
-                        
                         # Provide conservative estimates based on executable type
                         if ($ExecutablePath -like "*DISM.exe*") {
                             # DISM estimation - very conservative during silent periods
@@ -1005,9 +872,7 @@ $script:commandRunnerScriptBlock = {
                                 # Later phase - DISM often stalls at 62% during cleanup
                                 $increment = [Math]::Min(1, [Math]::Floor($noProgressCounter / 8))
                             }
-                            
                             $newEstimate = [Math]::Min($lastProgressPercent + $increment, 95)
-                            
                             if ($newEstimate -gt $lastEstimatedProgress -and ($noProgressCounter % 4) -eq 0) {
                                 $lastEstimatedProgress = $newEstimate
                                 Send-ProgressUpdate "$newEstimate% - DISM operation continuing (estimated)..."
@@ -1018,7 +883,6 @@ $script:commandRunnerScriptBlock = {
                             # SFC estimation - based on typical scan duration
                             $elapsedMinutes = $elapsedTotal / 60
                             $conservativeEstimate = [Math]::Min([int]($elapsedMinutes * 3), 95)
-                            
                             if ($conservativeEstimate -gt $lastProgressPercent -and 
                                 $conservativeEstimate -gt $lastEstimatedProgress) {
                                 $lastEstimatedProgress = $conservativeEstimate
@@ -1027,7 +891,6 @@ $script:commandRunnerScriptBlock = {
                             }
                         }
                     }
-                    
                     # Short sleep to prevent busy waiting
                     Start-Sleep -Milliseconds 250
                 }
@@ -1037,7 +900,6 @@ $script:commandRunnerScriptBlock = {
                 Start-Sleep -Milliseconds 500
             }
         }
-        
         # Process has exited, read any remaining output
         try {
             while (-not $process.StandardOutput.EndOfStream) {
@@ -1046,7 +908,6 @@ $script:commandRunnerScriptBlock = {
                     $cleanLine = Get-CleanOutputLine -RawLine $line
                     if ($null -ne $cleanLine) {
                         $outputBuffer.Add($cleanLine)
-                        
                         # Check for final percentage
                         $percent = Get-ProgressPercent -Line $cleanLine
                         if ($percent -ge 0 -and $percent -le 100) {
@@ -1059,7 +920,6 @@ $script:commandRunnerScriptBlock = {
         catch {
             # Error reading remaining output, continue
         }
-        
         # Read standard error
         try {
             if (-not $process.StandardError.EndOfStream) {
@@ -1075,11 +935,9 @@ $script:commandRunnerScriptBlock = {
         catch {
             $standardErrorText = "Failed to read standard error: $($_.Exception.Message)"
         }
-        
         # Wait for process to fully exit
         $process.WaitForExit()
         $actualExitCode = $process.ExitCode
-        
         # Send completion progress
         if ($actualExitCode -eq 0) {
             Send-ProgressUpdate "100% - Operation completed successfully"
@@ -1087,10 +945,8 @@ $script:commandRunnerScriptBlock = {
         else {
             Send-ProgressUpdate "$lastProgressPercent% - Process completed with exit code: $actualExitCode"
         }
-        
         # Calculate duration
         $jobDuration = (Get-Date) - $jobStartTime
-        
         # Output result object
         Write-Output "COMMAND_RESULT_START"
         Write-Output ([PSCustomObject]@{
@@ -1104,7 +960,6 @@ $script:commandRunnerScriptBlock = {
             FinalProgress  = if ($actualExitCode -eq 0) { 100 } else { $lastProgressPercent }
         })
         Write-Output "COMMAND_RESULT_END"
-        
         # Cleanup
         $process.Close()
         $process.Dispose()
@@ -1114,7 +969,6 @@ $script:commandRunnerScriptBlock = {
         $jobDuration = (Get-Date) - $jobStartTime
         $errorMessage = "Failed to start or monitor process: $($_.Exception.Message)"
         Send-ProgressUpdate "ERROR: $errorMessage"
-        
         Write-Output "COMMAND_RESULT_START"
         Write-Output ([PSCustomObject]@{
             ExitCode       = -999
@@ -1130,56 +984,45 @@ $script:commandRunnerScriptBlock = {
     }
 }
 #endregion
-
 #region 8. Disk Cleanup ScriptBlock - Comprehensive System Cleanup (COMPLETE)
 $script:diskCleanupScriptBlock = {
     param(
         [Parameter(Mandatory = $false)]
         [string]$LogPath = "",
-        
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$JobId,
-        
         [Parameter(Mandatory = $false)]
         [ValidateRange(60, 3600)]
         [int]$CleanupTimeoutSeconds = 300,
-        
         [Parameter(Mandatory = $false)]
         [bool]$AggressiveLogCleanup = $false
     )
-
     $jobStartTime = Get-Date
     $script:loggedLockedFiles = @{}
-
     function Write-LockedFileLog {
         param(
             [Parameter(Mandatory = $true)]
             [string]$FileName,
-            
             [Parameter(Mandatory = $true)]
             [string]$Category
         )
-        
         $key = "$Category`:$FileName"
         if (-not $script:loggedLockedFiles.ContainsKey($key)) {
             $script:loggedLockedFiles[$key] = $true
             Write-SimpleLog "Could not remove $FileName (in use) - $Category"
         }
     }
-
     function Write-SimpleLog {
         param(
             [Parameter(Mandatory = $true)]
             [ValidateNotNull()]
             [string]$message
         )
-        
         try {
             if (-not [string]::IsNullOrWhiteSpace($LogPath) -and (Test-Path (Split-Path $LogPath -Parent))) {
                 $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
                 $logEntry = "[$timestamp] [PROG] [System Cleanup] $message"
-                
                 $logMutex = [System.Threading.Mutex]::new($false, "RepairToolkitCleanupLog")
                 try {
                     $acquired = $logMutex.WaitOne(1000)
@@ -1199,46 +1042,37 @@ $script:diskCleanupScriptBlock = {
             Write-Error "LOG_FALLBACK: $message"
         }
     }
-
     function Update-Progress {
         param(
             [Parameter(Mandatory = $true)]
             [ValidateRange(0, 100)]
             [int]$Percent, 
-            
             [Parameter(Mandatory = $true)]
             [ValidateNotNullOrEmpty()]
             [string]$Message
         )
-        
         Write-Output "PROGRESS_LINE:$Percent% - $Message"
         Write-SimpleLog "$Percent% - $Message"
     }
-
     function Set-CleanupRegistryFlags {
         param(
             [Parameter(Mandatory = $true)]
             [ValidateNotNull()]
             [array]$Categories, 
-            
             [Parameter(Mandatory = $true)]
             [ValidateRange(0, 9999)]
             [int]$SageSet
         )
-        
         if ($Categories.Count -eq 0) {
             Write-SimpleLog "No categories provided to configure"
             return 0
         }
-        
         $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches"
         $configured = 0
-        
         foreach ($category in $Categories) {
             if ([string]::IsNullOrWhiteSpace($category)) {
                 continue
             }
-            
             try {
                 $categoryPath = Join-Path $regPath $category
                 if (Test-Path $categoryPath) {
@@ -1250,15 +1084,12 @@ $script:diskCleanupScriptBlock = {
                 Write-SimpleLog "Could not configure category '$category': $($_.Exception.Message)"
             }
         }
-        
         return $configured
     }
-
     function Get-AvailableCleanupCategories {
         try {
             $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches"
             $availableCategories = @()
-            
             if (Test-Path $regPath) {
                 $subKeys = Get-ChildItem $regPath -ErrorAction SilentlyContinue
                 if ($subKeys) {
@@ -1270,7 +1101,6 @@ $script:diskCleanupScriptBlock = {
                     }
                 }
             }
-            
             Write-SimpleLog "Found $($availableCategories.Count) available cleanup categories"
             return $availableCategories
         }
@@ -1289,23 +1119,18 @@ $script:diskCleanupScriptBlock = {
             )
         }
     }
-
     function Invoke-EnhancedCleanup {
         param(
             [Parameter(Mandatory = $true)]
             [ValidateNotNull()]
             [array]$Categories, 
-            
             [Parameter(Mandatory = $true)]
             [ValidateRange(0, 9999)]
             [int]$SageSet
         )
-        
         try {
             Write-SimpleLog "Configuring cleanup categories for native Windows cleanup"
-            
             $configured = Set-CleanupRegistryFlags -Categories $Categories -SageSet $SageSet
-            
             Write-SimpleLog "Configured $configured cleanup categories for Windows native cleanup"
             if ($configured -gt 0) {
                 Write-SimpleLog "Native cleanup will target: $($Categories -join ', ')"
@@ -1317,7 +1142,6 @@ $script:diskCleanupScriptBlock = {
             return $false
         }
     }
-
     function Test-RobocopyAvailable {
         try {
             $robocopyCmd = Get-Command "robocopy.exe" -ErrorAction SilentlyContinue
@@ -1327,22 +1151,18 @@ $script:diskCleanupScriptBlock = {
             return $false
         }
     }
-
     function Test-PowerShellVersion {
         param([int]$MinimumVersion = 5)
-        # FIXED: Use $Host.Version instead of $PSVersionTable
+        # Use $Host.Version instead of $PSVersionTable
         return $Host.Version.Major -ge $MinimumVersion
     }
-
     function Wait-ProcessStop {
         param(
             [Parameter(Mandatory = $true)]
             [string]$ProcessName,
-            
             [Parameter()]
             [int]$TimeoutSeconds = 15
         )
-        
         $timeout = (Get-Date).AddSeconds($TimeoutSeconds)
         while ((Get-Date) -lt $timeout) {
             $process = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue
@@ -1353,32 +1173,26 @@ $script:diskCleanupScriptBlock = {
         }
         return $false
     }
-
     function Remove-WindowsOld {
         param(
             [Parameter(Mandatory = $true)]
             [ValidateNotNullOrEmpty()]
             [string]$WindowsOldPath
         )
-        
         if (-not (Test-Path $WindowsOldPath)) {
             Write-SimpleLog "Windows.old path does not exist: $WindowsOldPath"
             return $true
         }
-        
         try {
             Write-SimpleLog "Attempting Windows.old removal using multiple methods"
-            
             # Method 1: Use cleanmgr with Previous Installations
             try {
                 $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches\Previous Installations"
                 if (Test-Path $regPath) {
                     Set-ItemProperty -Path $regPath -Name "StateFlags0099" -Value 2 -Type DWord -Force -ErrorAction Stop
                     Write-SimpleLog "Configured Previous Installations cleanup category"
-                    
                     $process = Start-Process -FilePath "cleanmgr.exe" -ArgumentList "/SAGERUN:0099" -WindowStyle Hidden -PassThru -ErrorAction Stop
                     $completed = $process.WaitForExit($CleanupTimeoutSeconds * 1000)
-                    
                     if ($completed -and $process.ExitCode -eq 0) {
                         Write-SimpleLog "Windows.old cleanup completed via cleanmgr"
                         if (-not (Test-Path $WindowsOldPath)) {
@@ -1400,16 +1214,13 @@ $script:diskCleanupScriptBlock = {
             catch {
                 Write-SimpleLog "Cleanmgr method failed: $($_.Exception.Message)"
             }
-            
             # Method 2: Robocopy mirror method
             if (Test-RobocopyAvailable) {
                 try {
                     Write-SimpleLog "Attempting Robocopy removal method"
                     $tempDirName = "EmptyForRobocopy_$($JobId)_$(Get-Random)"
                     $emptyDir = Join-Path $env:TEMP $tempDirName
-                    
                     New-Item -Path $emptyDir -ItemType Directory -Force | Out-Null
-                    
                     $robocopyArgs = @(
                         "`"$emptyDir`"",
                         "`"$WindowsOldPath`"",
@@ -1422,19 +1233,15 @@ $script:diskCleanupScriptBlock = {
                         "/NFL",
                         "/NDL"
                     )
-                    
                     $robocopyProcess = Start-Process -FilePath "robocopy.exe" -ArgumentList $robocopyArgs -WindowStyle Hidden -PassThru -ErrorAction Stop
                     $robocopyCompleted = $robocopyProcess.WaitForExit(($CleanupTimeoutSeconds / 2) * 1000)
-                    
                     if ($robocopyCompleted) {
                         $exitCode = $robocopyProcess.ExitCode
                         Write-SimpleLog "Robocopy completed with exit code: $exitCode"
-                        
                         # Robocopy exit codes 0-7 are success codes
                         if ($exitCode -le 7) {
                             Remove-Item $emptyDir -Force -Recurse -ErrorAction SilentlyContinue
                             Remove-Item $WindowsOldPath -Force -Recurse -ErrorAction SilentlyContinue
-                            
                             if (-not (Test-Path $WindowsOldPath)) {
                                 Write-SimpleLog "Windows.old removed successfully via Robocopy method"
                                 return $true
@@ -1449,38 +1256,31 @@ $script:diskCleanupScriptBlock = {
                             Write-SimpleLog "Could not kill robocopy process: $($_.Exception.Message)"
                         }
                     }
-                    
                     Remove-Item $emptyDir -Force -Recurse -ErrorAction SilentlyContinue
                 }
                 catch {
                     Write-SimpleLog "Robocopy removal method failed: $($_.Exception.Message)"
                 }
             }
-            
             # Method 3: PowerShell removal with retries
             try {
                 Write-SimpleLog "Attempting PowerShell removal method"
-                
                 $removed = $false
                 for ($attempt = 1; $attempt -le 3; $attempt++) {
                     try {
                         if (Test-Path $WindowsOldPath) {
                             Write-SimpleLog "PowerShell removal attempt $attempt"
-                            
                             # First, try to remove files
                             Get-ChildItem -Path $WindowsOldPath -Recurse -Force -ErrorAction SilentlyContinue |
                             Where-Object { -not $_.PSIsContainer } |
                             Remove-Item -Force -ErrorAction SilentlyContinue
-                            
                             # Then remove directories from deepest to shallowest
                             Get-ChildItem -Path $WindowsOldPath -Recurse -Force -ErrorAction SilentlyContinue |
                             Where-Object { $_.PSIsContainer } |
                             Sort-Object FullName -Descending |
                             Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
-                            
                             # Finally, remove the root directory
                             Remove-Item -Path $WindowsOldPath -Force -Recurse -ErrorAction SilentlyContinue
-                            
                             if (-not (Test-Path $WindowsOldPath)) {
                                 Write-SimpleLog "Windows.old removed successfully on attempt $attempt"
                                 $removed = $true
@@ -1496,12 +1296,10 @@ $script:diskCleanupScriptBlock = {
                     catch {
                         Write-SimpleLog "PowerShell attempt $attempt failed: $($_.Exception.Message)"
                     }
-                    
                     if ($attempt -lt 3) {
                         Start-Sleep -Seconds 5
                     }
                 }
-                
                 if ($removed) {
                     return $true
                 }
@@ -1509,21 +1307,16 @@ $script:diskCleanupScriptBlock = {
             catch {
                 Write-SimpleLog "PowerShell removal method failed: $($_.Exception.Message)"
             }
-            
             # Check remaining content
             try {
                 if (Test-Path $WindowsOldPath) {
                     $remainingSize = (Get-ChildItem -Path $WindowsOldPath -Recurse -Force -ErrorAction SilentlyContinue | 
                         Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
-                    
                     if ($null -eq $remainingSize) {
                         $remainingSize = 0
                     }
-                    
                     $remainingSizeMB = [Math]::Round($remainingSize / 1MB, 1)
-                    
                     Write-SimpleLog "Windows.old still exists with $remainingSizeMB MB remaining"
-                    
                     # Consider partial success if significantly reduced
                     if ($remainingSizeMB -lt 100) {
                         Write-SimpleLog "Windows.old significantly reduced - considering partial success"
@@ -1534,7 +1327,6 @@ $script:diskCleanupScriptBlock = {
             catch {
                 Write-SimpleLog "Could not check remaining Windows.old content: $($_.Exception.Message)"
             }
-            
             Write-SimpleLog "All Windows.old removal methods completed"
             return $false
         }
@@ -1543,7 +1335,6 @@ $script:diskCleanupScriptBlock = {
             return $false
         }
     }
-
     function Clear-DefenderFiles {
         try {
             Write-SimpleLog "Note: Skipping Defender file cleanup to avoid antivirus conflicts"
@@ -1555,14 +1346,11 @@ $script:diskCleanupScriptBlock = {
             return @{ Files = 0; Size = 0 }
         }
     }
-
     function Clear-DeliveryOptimization {
         try {
             $totalSize = 0
             $totalFiles = 0
-            
             $cacheLocations = [System.Collections.Generic.List[string]]::new()
-            
             # Check for custom cache location in registry
             try {
                 $regPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"
@@ -1584,7 +1372,6 @@ $script:diskCleanupScriptBlock = {
             catch {
                 Write-SimpleLog "Could not read DO registry settings: $($_.Exception.Message)"
             }
-            
             # Add default locations
             if ($cacheLocations.Count -eq 0) {
                 $defaultLocations = @(
@@ -1597,11 +1384,9 @@ $script:diskCleanupScriptBlock = {
                     $cacheLocations.Add($loc)
                 }
             }
-            
             # Check all drives for additional DO caches
             foreach ($drive in (Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue)) {
                 if ($null -eq $drive) { continue }
-                
                 $driveLetter = $drive.Name
                 $alternatePaths = @(
                     "${driveLetter}:\DeliveryOptimization",
@@ -1614,7 +1399,6 @@ $script:diskCleanupScriptBlock = {
                     }
                 }
             }
-            
             # Process each location
             foreach ($location in $cacheLocations) {
                 if (Test-Path $location) {
@@ -1626,10 +1410,8 @@ $script:diskCleanupScriptBlock = {
                             $_.Length -gt 0 -and
                             $_.Length -lt 15GB
                         }
-                        
                         $locationSize = 0
                         $locationFiles = 0
-                        
                         if ($cacheFiles) {
                             foreach ($file in $cacheFiles) {
                                 try {
@@ -1645,7 +1427,6 @@ $script:diskCleanupScriptBlock = {
                                 }
                             }
                         }
-                        
                         if ($locationFiles -gt 0) {
                             $locationSizeMB = [Math]::Round($locationSize / 1MB, 1)
                             Write-SimpleLog "Delivery Optimization from ${location}: $locationFiles files, $locationSizeMB MB"
@@ -1656,7 +1437,6 @@ $script:diskCleanupScriptBlock = {
                     }
                 }
             }
-            
             $sizeMB = [Math]::Round($totalSize / 1MB, 1)
             Write-SimpleLog "Delivery Optimization cleanup: $totalFiles files, $sizeMB MB"
             return @{ Files = $totalFiles; Size = $totalSize }
@@ -1666,191 +1446,169 @@ $script:diskCleanupScriptBlock = {
             return @{ Files = 0; Size = 0 }
         }
     }
-
     function Clear-InternetTemporaryFiles {
         try {
             $totalSize = 0
             $totalFiles = 0
-            
-            $currentUserPaths = [System.Collections.Generic.List[hashtable]]::new()
-            
-            # Internet Explorer / Edge paths
-            $basePaths = @(
-                @{ Path = "$env:LOCALAPPDATA\Microsoft\Windows\INetCache"; Name = "IE/Edge Cache" },
-                @{ Path = "$env:LOCALAPPDATA\Microsoft\Windows\INetCookies"; Name = "IE/Edge Cookies" },
-                @{ Path = "$env:LOCALAPPDATA\Microsoft\Windows\WebCache"; Name = "Web Cache" },
-                @{ Path = "$env:LOCALAPPDATA\Temp\IEDownloadHistory"; Name = "IE Download History" },
-                @{ Path = "$env:APPDATA\Microsoft\Windows\Cookies"; Name = "Legacy Cookies" }
-            )
-            
-            foreach ($pathInfo in $basePaths) {
-                $currentUserPaths.Add($pathInfo)
-            }
-            
-            # Browser-specific paths
-            $browserBasePaths = @(
-                @{ Path = "$env:LOCALAPPDATA\Microsoft\Edge\User Data"; Name = "Edge Chromium" },
-                @{ Path = "$env:LOCALAPPDATA\Google\Chrome\User Data"; Name = "Chrome" },
-                @{ Path = "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data"; Name = "Brave" }
-            )
-            
-            foreach ($browserBase in $browserBasePaths) {
-                if (Test-Path $browserBase.Path) {
-                    try {
-                        $profiles = Get-ChildItem -Path $browserBase.Path -Directory -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -match "^(Default|Profile \d+|System Profile|Guest Profile)$" }
-                        
-                        if ($profiles) {
-                            foreach ($userProfile in $profiles) {
-                                $cachePaths = @(
-                                    @{ Path = (Join-Path $userProfile.FullName "Cache"); Name = "$($browserBase.Name) Cache ($($userProfile.Name))" },
-                                    @{ Path = (Join-Path $userProfile.FullName "Code Cache"); Name = "$($browserBase.Name) Code Cache ($($userProfile.Name))" },
-                                    @{ Path = (Join-Path $userProfile.FullName "GPUCache"); Name = "$($browserBase.Name) GPU Cache ($($userProfile.Name))" }
-                                )
-                                
-                                foreach ($cachePath in $cachePaths) {
-                                    if ($null -ne $cachePath) {
-                                        $currentUserPaths.Add($cachePath)
+            # Get all user profiles (exclude system accounts)
+            $UserProfiles = Get-ChildItem -Path "C:\Users" -Directory -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Name -notin @("Public", "Default", "Default User", "All Users", "ADMINI~1") -and
+                    $_.Name -notmatch '^(Default|Public|Guest|.*\$$)'
+                }
+            foreach ($Profile in $UserProfiles) {
+                $currentUserPaths = [System.Collections.Generic.List[hashtable]]::new()
+                # Browser and system cache paths (per-user)
+                $basePaths = @(
+                    @{ Path = "$($Profile.FullName)\AppData\Local\Microsoft\Windows\INetCache"; Name = "IE/Edge Cache" },
+                    @{ Path = "$($Profile.FullName)\AppData\Local\Microsoft\Windows\INetCookies"; Name = "IE/Edge Cookies" },
+                    @{ Path = "$($Profile.FullName)\AppData\Local\Microsoft\Windows\WebCache"; Name = "Web Cache" },
+                    @{ Path = "$($Profile.FullName)\AppData\Local\Temp\IEDownloadHistory"; Name = "IE Download History" },
+                    @{ Path = "$($Profile.FullName)\AppData\Roaming\Microsoft\Windows\Cookies"; Name = "Legacy Cookies" }
+                )
+                foreach ($pathInfo in $basePaths) {
+                    $currentUserPaths.Add($pathInfo)
+                }
+                # Browser-specific paths
+                $browserBasePaths = @(
+                    @{ Path = "$($Profile.FullName)\AppData\Local\Microsoft\Edge\User Data"; Name = "Edge Chromium" },
+                    @{ Path = "$($Profile.FullName)\AppData\Local\Google\Chrome\User Data"; Name = "Chrome" },
+                    @{ Path = "$($Profile.FullName)\AppData\Local\BraveSoftware\Brave-Browser\User Data"; Name = "Brave" }
+                )
+                foreach ($browserBase in $browserBasePaths) {
+                    if (Test-Path $browserBase.Path) {
+                        try {
+                            $profiles = Get-ChildItem -Path $browserBase.Path -Directory -ErrorAction SilentlyContinue |
+                            Where-Object { $_.Name -match "^(Default|Profile \d+|System Profile|Guest Profile)$" }
+                            if ($profiles) {
+                                foreach ($userProfile in $profiles) {
+                                    $cachePaths = @(
+                                        @{ Path = (Join-Path $userProfile.FullName "Cache"); Name = "$($browserBase.Name) Cache ($($userProfile.Name))" },
+                                        @{ Path = (Join-Path $userProfile.FullName "Code Cache"); Name = "$($browserBase.Name) Code Cache ($($userProfile.Name))" },
+                                        @{ Path = (Join-Path $userProfile.FullName "GPUCache"); Name = "$($browserBase.Name) GPU Cache ($($userProfile.Name))" }
+                                    )
+                                    foreach ($cachePath in $cachePaths) {
+                                        if ($null -ne $cachePath) {
+                                            $currentUserPaths.Add($cachePath)
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    catch {
-                        Write-SimpleLog "Error enumerating $($browserBase.Name) profiles: $($_.Exception.Message)"
+                        catch {
+                            Write-SimpleLog "Error enumerating $($browserBase.Name) profiles for $($Profile.Name): $($_.Exception.Message)"
+                        }
                     }
                 }
-            }
-            
-            # Firefox profiles
-            $firefoxProfilesPath = "$env:APPDATA\Mozilla\Firefox\Profiles"
-            if (Test-Path $firefoxProfilesPath) {
-                try {
-                    $firefoxProfiles = Get-ChildItem -Path $firefoxProfilesPath -Directory -ErrorAction SilentlyContinue
-                    if ($firefoxProfiles) {
-                        foreach ($firefoxUserProfile in $firefoxProfiles) {
-                            $firefoxCache = Join-Path $firefoxUserProfile.FullName "cache2"
-                            if (Test-Path $firefoxCache) {
-                                $currentUserPaths.Add(@{ Path = $firefoxCache; Name = "Firefox Cache ($($firefoxUserProfile.Name))" })
+                # Firefox
+                $firefoxProfilesPath = "$($Profile.FullName)\AppData\Roaming\Mozilla\Firefox\Profiles"
+                if (Test-Path $firefoxProfilesPath) {
+                    try {
+                        $firefoxProfiles = Get-ChildItem -Path $firefoxProfilesPath -Directory -ErrorAction SilentlyContinue
+                        if ($firefoxProfiles) {
+                            foreach ($firefoxUserProfile in $firefoxProfiles) {
+                                $firefoxCache = Join-Path $firefoxUserProfile.FullName "cache2"
+                                if (Test-Path $firefoxCache) {
+                                    $currentUserPaths.Add(@{ Path = $firefoxCache; Name = "Firefox Cache ($($firefoxUserProfile.Name))" })
+                                }
                             }
+                        }
+                    }
+                    catch {
+                        Write-SimpleLog "Error enumerating Firefox profiles for $($Profile.Name): $($_.Exception.Message)"
+                    }
+                }
+                # Process all cache paths for this user
+                foreach ($pathInfo in $currentUserPaths) {
+                    if ($null -ne $pathInfo -and $pathInfo.Path -and (Test-Path $pathInfo.Path)) {
+                        try {
+                            $ageThreshold = (Get-Date).AddHours(-2)
+                            $files = Get-ChildItem -Path $pathInfo.Path -Recurse -Force -ErrorAction SilentlyContinue |
+                            Where-Object { 
+                                -not $_.PSIsContainer -and 
+                                $_.Length -gt 0 -and 
+                                $_.Length -lt 500MB -and
+                                $_.LastWriteTime -lt $ageThreshold
+                            }
+                            $pathSize = 0
+                            $pathFiles = 0
+                            if ($files) {
+                                foreach ($file in $files) {
+                                    try {
+                                        $fileSize = $file.Length
+                                        Remove-Item $file.FullName -Force -ErrorAction Stop
+                                        $pathFiles++
+                                        $pathSize += $fileSize
+                                    }
+                                    catch {
+                                        # Skip locked files
+                                    }
+                                }
+                            }
+                            if ($pathFiles -gt 0) {
+                                $pathSizeMB = [Math]::Round($pathSize / 1MB, 1)
+                                Write-SimpleLog "$($pathInfo.Name) for $($Profile.Name): $pathFiles files, $pathSizeMB MB"
+                            }
+                            $totalFiles += $pathFiles
+                            $totalSize += $pathSize
+                        }
+                        catch {
+                            Write-SimpleLog "Error processing $($pathInfo.Name) for $($Profile.Name): $($_.Exception.Message)"
+                        }
+                    }
+                }
+                # Legacy IE cache
+                try {
+                    $ieCachePath = "$($Profile.FullName)\AppData\Local\Microsoft\Windows\Temporary Internet Files"
+                    if (Test-Path $ieCachePath) {
+                        $ieFiles = Get-ChildItem -Path $ieCachePath -Recurse -Force -ErrorAction SilentlyContinue |
+                        Where-Object { -not $_.PSIsContainer -and $_.Length -gt 0 -and $_.Length -lt 100MB }
+                        $ieSize = 0
+                        $ieCount = 0
+                        if ($ieFiles) {
+                            foreach ($file in $ieFiles) {
+                                try {
+                                    $fileSize = $file.Length
+                                    Remove-Item $file.FullName -Force -ErrorAction Stop
+                                    $ieCount++
+                                    $ieSize += $fileSize
+                                }
+                                catch {
+                                    # Skip locked
+                                }
+                            }
+                        }
+                        if ($ieCount -gt 0) {
+                            $ieSizeMB = [Math]::Round($ieSize / 1MB, 1)
+                            Write-SimpleLog "Legacy IE Cache for $($Profile.Name): $ieCount files, $ieSizeMB MB"
+                            $totalFiles += $ieCount
+                            $totalSize += $ieSize
                         }
                     }
                 }
                 catch {
-                    Write-SimpleLog "Error enumerating Firefox profiles: $($_.Exception.Message)"
+                    Write-SimpleLog "Error cleaning legacy IE cache for $($Profile.Name): $($_.Exception.Message)"
                 }
             }
-            
-            # Process all paths
-            foreach ($pathInfo in $currentUserPaths) {
-                if ($null -ne $pathInfo -and $pathInfo.Path -and (Test-Path $pathInfo.Path)) {
-                    try {
-                        $ageThreshold = (Get-Date).AddHours(-2)
-                        
-                        $files = Get-ChildItem -Path $pathInfo.Path -Recurse -Force -ErrorAction SilentlyContinue |
-                        Where-Object { 
-                            -not $_.PSIsContainer -and 
-                            $_.Length -gt 0 -and 
-                            $_.Length -lt 500MB -and
-                            $_.LastWriteTime -lt $ageThreshold
-                        }
-                        
-                        $pathSize = 0
-                        $pathFiles = 0
-                        $lockedFiles = 0
-                        
-                        if ($files) {
-                            foreach ($file in $files) {
-                                try {
-                                    $fileSize = $file.Length
-                                    Remove-Item $file.FullName -Force -ErrorAction Stop
-                                    $pathFiles++
-                                    $pathSize += $fileSize
-                                }
-                                catch {
-                                    $lockedFiles++
-                                }
-                            }
-                        }
-                        
-                        if ($pathFiles -gt 0) {
-                            $pathSizeMB = [Math]::Round($pathSize / 1MB, 1)
-                            $lockedMessage = if ($lockedFiles -gt 0) { " ($lockedFiles locked)" } else { "" }
-                            Write-SimpleLog "$($pathInfo.Name): $pathFiles files, $pathSizeMB MB$lockedMessage"
-                        }
-                        
-                        $totalFiles += $pathFiles
-                        $totalSize += $pathSize
-                    }
-                    catch {
-                        Write-SimpleLog "Error processing $($pathInfo.Name): $($_.Exception.Message)"
-                    }
-                }
-            }
-            
-            # Legacy IE cache
-            try {
-                $ieCachePath = "$env:USERPROFILE\AppData\Local\Microsoft\Windows\Temporary Internet Files"
-                if (Test-Path $ieCachePath) {
-                    $ieFiles = Get-ChildItem -Path $ieCachePath -Recurse -Force -ErrorAction SilentlyContinue |
-                    Where-Object { 
-                        -not $_.PSIsContainer -and 
-                        $_.Length -gt 0 -and 
-                        $_.Length -lt 100MB
-                    }
-                    
-                    $ieSize = 0
-                    $ieCount = 0
-                    
-                    if ($ieFiles) {
-                        foreach ($file in $ieFiles) {
-                            try {
-                                $fileSize = $file.Length
-                                Remove-Item $file.FullName -Force -ErrorAction Stop
-                                $ieCount++
-                                $ieSize += $fileSize
-                            }
-                            catch {
-                                Write-LockedFileLog -FileName $file.Name -Category "Additional Temp Files"
-                            }
-                        }
-                    }
-                    
-                    if ($ieCount -gt 0) {
-                        $ieSizeMB = [Math]::Round($ieSize / 1MB, 1)
-                        Write-SimpleLog "Legacy IE Cache: $ieCount files, $ieSizeMB MB"
-                        $totalFiles += $ieCount
-                        $totalSize += $ieSize
-                    }
-                }
-            }
-            catch {
-                Write-SimpleLog "Error cleaning legacy IE cache: $($_.Exception.Message)"
-            }
-            
             $sizeMB = [Math]::Round($totalSize / 1MB, 1)
-            Write-SimpleLog "Internet temporary files cleanup: $totalFiles files, $sizeMB MB"
+            Write-SimpleLog "Internet temporary files cleanup (all users): $totalFiles files, $sizeMB MB"
             return @{ Files = $totalFiles; Size = $totalSize }
         }
         catch {
-            Write-SimpleLog "Error in Internet temporary files cleanup: $($_.Exception.Message)"
+            Write-SimpleLog "Error in Internet temporary files cleanup (all users): $($_.Exception.Message)"
             return @{ Files = 0; Size = 0 }
         }
     }
-
     function Clear-RecycleBinSafely {
         try {
             $recyclerStats = @{ Files = 0; Size = 0 }
-            
             # Try to measure recycle bin size first
             try {
                 $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
                 $recyclerPath = "$env:SYSTEMDRIVE\`$Recycle.Bin\$currentUserSid"
-                
                 if (Test-Path $recyclerPath) {
                     $recyclerFiles = Get-ChildItem -Path $recyclerPath -Force -ErrorAction SilentlyContinue |
                     Where-Object { -not $_.PSIsContainer -and $_.Length -gt 0 }
-                    
                     if ($recyclerFiles) {
                         $recyclerStats.Files = $recyclerFiles.Count
                         $recyclerStats.Size = ($recyclerFiles | Measure-Object -Property Length -Sum -ErrorAction SilentlyContinue).Sum
@@ -1863,14 +1621,11 @@ $script:diskCleanupScriptBlock = {
             catch {
                 Write-SimpleLog "Could not measure Recycle Bin size: $($_.Exception.Message)"
             }
-            
             # Try modern Clear-RecycleBin cmdlet first
             if (Test-PowerShellVersion -MinimumVersion 5) {
                 try {
                     Clear-RecycleBin -Force -ErrorAction Stop
-                    
                     Start-Sleep -Milliseconds 500
-                    
                     if ($recyclerStats.Files -gt 0) {
                         $recyclerSizeMB = [Math]::Round($recyclerStats.Size / 1MB, 1)
                         Write-SimpleLog "Recycle Bin (modern): $($recyclerStats.Files) files, $recyclerSizeMB MB"
@@ -1878,29 +1633,23 @@ $script:diskCleanupScriptBlock = {
                     else {
                         Write-SimpleLog "Recycle Bin was already empty"
                     }
-                    
                     return $recyclerStats
                 }
                 catch {
                     Write-SimpleLog "Modern Clear-RecycleBin failed: $($_.Exception.Message)"
                 }
             }
-            
             # Fallback to manual method
             try {
                 Write-SimpleLog "Falling back to manual Recycle Bin cleanup"
                 $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
                 $recyclerPath = "$env:SYSTEMDRIVE\`$Recycle.Bin\$currentUserSid"
-                
                 $recyclerStats = @{ Files = 0; Size = 0 }
-                
                 if (Test-Path $recyclerPath) {
                     $recyclerFiles = Get-ChildItem -Path $recyclerPath -Force -ErrorAction SilentlyContinue |
                     Where-Object { -not $_.PSIsContainer -and $_.Length -gt 0 }
-                    
                     $recyclerSize = 0
                     $recyclerCount = 0
-                    
                     if ($recyclerFiles) {
                         foreach ($file in $recyclerFiles) {
                             try {
@@ -1914,16 +1663,13 @@ $script:diskCleanupScriptBlock = {
                             }
                         }
                     }
-                    
                     if ($recyclerCount -gt 0) {
                         $recyclerSizeMB = [Math]::Round($recyclerSize / 1MB, 1)
                         Write-SimpleLog "Recycle Bin (manual): $recyclerCount files, $recyclerSizeMB MB"
                     }
-                    
                     $recyclerStats.Files = $recyclerCount
                     $recyclerStats.Size = $recyclerSize
                 }
-                
                 return $recyclerStats
             }
             catch {
@@ -1936,32 +1682,26 @@ $script:diskCleanupScriptBlock = {
             return @{ Files = 0; Size = 0 }
         }
     }
-
     function Clear-SystemTemporaryFiles {
         try {
-            $tempPaths = @(
-                @{ Path = $env:TEMP; Name = "User Temp"; AgeDays = 0; MaxSize = 1GB },
-                @{ Path = $env:TMP; Name = "User TMP"; AgeDays = 0; MaxSize = 1GB },
-                @{ Path = "$env:WINDIR\Temp"; Name = "Windows Temp"; AgeDays = 0; MaxSize = 5GB },
-                @{ Path = "$env:WINDIR\Logs\CBS"; Name = "CBS Logs"; AgeDays = 0; MaxSize = 30GB },
-                @{ Path = "$env:WINDIR\Logs\DISM"; Name = "DISM Logs"; AgeDays = 0; MaxSize = 2GB },
-                @{ Path = "$env:WINDIR\Logs\DPX"; Name = "Device Setup Logs"; AgeDays = 0; MaxSize = 2GB },
-                @{ Path = "$env:WINDIR\Logs\WindowsUpdate"; Name = "Windows Update Logs"; AgeDays = 0; MaxSize = 2GB },
-                @{ Path = "$env:WINDIR\SoftwareDistribution\Download"; Name = "Update Downloads"; AgeDays = 0; MaxSize = 20GB },
-                @{ Path = "$env:LOCALAPPDATA\Temp"; Name = "Local App Temp"; AgeDays = 0; MaxSize = 2GB },
-                @{ Path = "$env:WINDIR\Prefetch"; Name = "Prefetch Files"; AgeDays = 0; MaxSize = 500MB }
-            )
-            
             $totalSize = 0
             $totalFiles = 0
-            
-            foreach ($pathInfo in $tempPaths) {
+            # === SYSTEM-WIDE TEMP PATHS ===
+            $systemTempPaths = @(
+                @{ Path = "$env:WINDIR\Temp"; Name = "Windows Temp"; MaxSize = 5GB },
+                @{ Path = "$env:WINDIR\Logs\CBS"; Name = "CBS Logs"; MaxSize = 30GB },
+                @{ Path = "$env:WINDIR\Logs\DISM"; Name = "DISM Logs"; MaxSize = 2GB },
+                @{ Path = "$env:WINDIR\Logs\DPX"; Name = "Device Setup Logs"; MaxSize = 2GB },
+                @{ Path = "$env:WINDIR\Logs\WindowsUpdate"; Name = "Windows Update Logs"; MaxSize = 2GB },
+                @{ Path = "$env:WINDIR\SoftwareDistribution\Download"; Name = "Update Downloads"; MaxSize = 20GB },
+                @{ Path = "$env:WINDIR\Prefetch"; Name = "Prefetch Files"; MaxSize = 500MB }
+            )
+            foreach ($pathInfo in $systemTempPaths) {
                 if ($null -eq $pathInfo -or [string]::IsNullOrEmpty($pathInfo.Path) -or -not (Test-Path $pathInfo.Path)) {
                     continue
                 }
-                
                 try {
-                    # Special handling for CBS logs
+                    # Special handling for CBS.log
                     if ($pathInfo.Name -eq "CBS Logs") {
                         $cbsLogPath = Join-Path $pathInfo.Path "CBS.log"
                         if (Test-Path $cbsLogPath) {
@@ -1981,16 +1721,9 @@ $script:diskCleanupScriptBlock = {
                             }
                         }
                     }
-                    
-                    # Get files based on path type
                     $files = Get-ChildItem -Path $pathInfo.Path -Force -ErrorAction SilentlyContinue |
-                    Where-Object { 
-                        -not $_.PSIsContainer -and 
-                        $_.Length -gt 0 -and 
-                        $_.Length -lt $pathInfo.MaxSize
-                    }
-                    
-                    # Apply specific filters based on path type
+                    Where-Object { -not $_.PSIsContainer -and $_.Length -gt 0 -and $_.Length -lt $pathInfo.MaxSize }
+                    # Apply filters
                     if ($pathInfo.Name -eq "Update Downloads") {
                         $files = $files | Where-Object { $_.Extension -in @('.cab', '.msu', '.exe', '.tmp', '.psf', '.esd') }
                     }
@@ -2015,11 +1748,8 @@ $script:diskCleanupScriptBlock = {
                             $_.Name -like "*.old"
                         }
                     }
-                    
                     $pathSize = 0
                     $pathFiles = 0
-                    $lockedFiles = 0
-                    
                     if ($files) {
                         foreach ($file in $files) {
                             try {
@@ -2029,18 +1759,14 @@ $script:diskCleanupScriptBlock = {
                                 $pathSize += $fileSize
                             }
                             catch {
-                                $lockedFiles++
-                                Write-LockedFileLog -FileName $file.Name -Category $pathInfo.Name
+                                # Skip locked files
                             }
                         }
                     }
-                    
                     if ($pathFiles -gt 0) {
                         $pathSizeMB = [Math]::Round($pathSize / 1MB, 1)
-                        $lockedMessage = if ($lockedFiles -gt 0) { " ($lockedFiles files locked)" } else { "" }
-                        Write-SimpleLog "$($pathInfo.Name): $pathFiles files, $pathSizeMB MB$lockedMessage"
+                        Write-SimpleLog "$($pathInfo.Name): $pathFiles files, $pathSizeMB MB"
                     }
-                    
                     $totalFiles += $pathFiles
                     $totalSize += $pathSize
                 }
@@ -2048,10 +1774,57 @@ $script:diskCleanupScriptBlock = {
                     Write-SimpleLog "Error cleaning $($pathInfo.Name): $($_.Exception.Message)"
                 }
             }
-            
-            # Empty Recycle Bin
+            # === ALL USER TEMP PATHS ===
+            $UserProfiles = Get-ChildItem -Path "C:\Users" -Directory -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Name -notin @("Public", "Default", "Default User", "All Users", "ADMINI~1") -and
+                    $_.Name -notmatch '^(Default|Public|Guest|.*\$$)'
+                }
+            foreach ($Profile in $UserProfiles) {
+                $userTempPaths = @(
+                    "$($Profile.FullName)\AppData\Local\Temp",
+                    "$($Profile.FullName)\AppData\Roaming\temp"
+                )
+                foreach ($tempPath in $userTempPaths) {
+                    if (-not (Test-Path $tempPath)) { continue }
+                    try {
+                        $files = Get-ChildItem -Path $tempPath -Recurse -Force -ErrorAction SilentlyContinue |
+                        Where-Object { 
+                            -not $_.PSIsContainer -and 
+                            $_.Length -gt 0 -and 
+                            $_.Length -lt 1GB -and
+                            $_.LastWriteTime -lt (Get-Date).AddHours(-1)
+                        }
+                        $pathSize = 0
+                        $pathFiles = 0
+                        if ($files) {
+                            foreach ($file in $files) {
+                                try {
+                                    $fileSize = $file.Length
+                                    Remove-Item $file.FullName -Force -ErrorAction Stop
+                                    $pathFiles++
+                                    $pathSize += $fileSize
+                                }
+                                catch {
+                                    # Skip locked
+                                }
+                            }
+                        }
+                        if ($pathFiles -gt 0) {
+                            $pathSizeMB = [Math]::Round($pathSize / 1MB, 1)
+                            Write-SimpleLog "User Temp for $($Profile.Name): $pathFiles files, $pathSizeMB MB"
+                        }
+                        $totalFiles += $pathFiles
+                        $totalSize += $pathSize
+                    }
+                    catch {
+                        Write-SimpleLog "Error cleaning user temp for $($Profile.Name): $($_.Exception.Message)"
+                    }
+                }
+            }
+            # Recycle Bin (all users handled by cleanmgr fallback)
             try {
-                Write-SimpleLog "Emptying Recycle Bin"
+                Write-SimpleLog "Emptying Recycle Bin (current user)"
                 $recyclerResult = Clear-RecycleBinSafely
                 $totalFiles += $recyclerResult.Files
                 $totalSize += $recyclerResult.Size
@@ -2059,162 +1832,120 @@ $script:diskCleanupScriptBlock = {
             catch {
                 Write-SimpleLog "Error cleaning Recycle Bin: $($_.Exception.Message)"
             }
-            
-            # Additional temp paths
-            try {
-                $additionalTempPaths = @(
-                    "$env:WINDIR\system32\tmp",
-                    "$env:WINDIR\SysWOW64\tmp",
-                    "$env:APPDATA\temp",
-                    "$env:LOCALAPPDATA\Microsoft\Windows\WebCache\*.log",
-                    "$env:LOCALAPPDATA\Microsoft\Windows\INetCache\*.dat"
-                )
-                
-                foreach ($tempPath in $additionalTempPaths) {
-                    if ([string]::IsNullOrWhiteSpace($tempPath)) {
-                        continue
-                    }
-                    
-                    if ($tempPath -like "*\*.*") {
-                        $parentPath = Split-Path $tempPath -Parent
-                        $filePattern = Split-Path $tempPath -Leaf
-                        if (Test-Path $parentPath) {
-                            $tempFiles = Get-ChildItem -Path $parentPath -Filter $filePattern -Force -ErrorAction SilentlyContinue |
-                            Where-Object { -not $_.PSIsContainer -and $_.Length -gt 0 -and $_.Length -lt 100MB }
-                            
-                            if ($tempFiles) {
-                                foreach ($file in $tempFiles) {
-                                    try {
-                                        $fileSize = $file.Length
-                                        Remove-Item $file.FullName -Force -ErrorAction Stop
-                                        $totalFiles++
-                                        $totalSize += $fileSize
-                                    }
-                                    catch {
-                                        Write-LockedFileLog -FileName $file.Name -Category "Additional Temp Files"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    elseif (Test-Path $tempPath) {
-                        $tempFiles = Get-ChildItem -Path $tempPath -Force -ErrorAction SilentlyContinue |
-                        Where-Object { 
-                            -not $_.PSIsContainer -and 
-                            $_.Length -gt 0 -and 
-                            $_.Length -lt 100MB
-                        }
-                        
-                        if ($tempFiles) {
-                            foreach ($file in $tempFiles) {
-                                try {
-                                    $fileSize = $file.Length
-                                    Remove-Item $file.FullName -Force -ErrorAction Stop
-                                    $totalFiles++
-                                    $totalSize += $fileSize
-                                }
-                                catch {
-                                    Write-LockedFileLog -FileName $file.Name -Category "Additional Temp Files"
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            catch {
-                Write-SimpleLog "Error cleaning additional temp paths: $($_.Exception.Message)"
-            }
-            
             return @{ Files = $totalFiles; Size = $totalSize }
         }
         catch {
-            Write-SimpleLog "Error in system temp file cleanup: $($_.Exception.Message)"
+            Write-SimpleLog "Error in system temp file cleanup (all users): $($_.Exception.Message)"
             return @{ Files = 0; Size = 0 }
         }
     }
-
     function Clear-ThumbnailFiles {
         try {
-            $thumbnailPaths = @(
+            $totalSize = 0
+            $totalFiles = 0
+            # System-wide thumbnail caches
+            $systemPaths = @(
                 "$env:LOCALAPPDATA\Thumbnails",
                 "$env:LOCALAPPDATA\Microsoft\Media Player",
                 "$env:APPDATA\Microsoft\Windows\Themes\CachedFiles",
                 "$env:LOCALAPPDATA\Microsoft\Windows\Caches"
             )
-            
-            $totalSize = 0
-            $totalFiles = 0
-            
-            foreach ($path in $thumbnailPaths) {
-                if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path $path)) {
-                    continue
-                }
-                
+            foreach ($path in $systemPaths) {
+                if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path $path)) { continue }
                 try {
-                    $allThumbnails = Get-ChildItem -Path $path -Recurse -Force -ErrorAction SilentlyContinue |
+                    $files = Get-ChildItem -Path $path -Recurse -Force -ErrorAction SilentlyContinue |
                     Where-Object { 
                         -not $_.PSIsContainer -and 
-                        (
-                            $_.Extension -in @('.db', '.tmp', '.cache') -or
-                            $_.Name -like "thumb*" -or
-                            $_.Name -like "Thumb*" -or
-                            $_.Name -like "*cache*"
-                        ) -and
-                        $_.Length -gt 0 -and 
-                        $_.Length -lt 100MB
+                        ($_.Extension -in @('.db', '.tmp', '.cache') -or $_.Name -like "*cache*") -and
+                        $_.Length -gt 0 -and $_.Length -lt 100MB
                     }
-                    
                     $pathSize = 0
                     $pathFiles = 0
-                    
-                    if ($allThumbnails) {
-                        foreach ($file in $allThumbnails) {
+                    if ($files) {
+                        foreach ($file in $files) {
                             try {
                                 $fileSize = $file.Length
                                 Remove-Item $file.FullName -Force -ErrorAction Stop
                                 $pathFiles++
                                 $pathSize += $fileSize
-                                $totalFiles++
-                                $totalSize += $fileSize
                             }
                             catch {
-                                # Silently continue
+                                # Skip locked
                             }
                         }
                     }
-                    
                     if ($pathFiles -gt 0) {
                         $pathSizeMB = [Math]::Round($pathSize / 1MB, 1)
-                        Write-SimpleLog "Thumbnails from $path`: $pathFiles files, $pathSizeMB MB"
+                        Write-SimpleLog "System thumbnails: $pathFiles files, $pathSizeMB MB"
                     }
+                    $totalFiles += $pathFiles
+                    $totalSize += $pathSize
                 }
                 catch {
-                    Write-SimpleLog "Error processing thumbnails in $path`: $($_.Exception.Message)"
+                    Write-SimpleLog "Error processing system thumbnails in $path`: $($_.Exception.Message)"
                 }
             }
-            
+            # All user thumbnail caches
+            $UserProfiles = Get-ChildItem -Path "C:\Users" -Directory -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Name -notin @("Public", "Default", "Default User", "All Users", "ADMINI~1") -and
+                    $_.Name -notmatch '^(Default|Public|Guest|.*\$$)'
+                }
+            foreach ($Profile in $UserProfiles) {
+                $userThumbPath = "$($Profile.FullName)\AppData\Local\Microsoft\Windows\Explorer"
+                if (Test-Path $userThumbPath) {
+                    try {
+                        $thumbFiles = Get-ChildItem -Path $userThumbPath -Force -ErrorAction SilentlyContinue |
+                        Where-Object { 
+                            -not $_.PSIsContainer -and 
+                            ($_.Name -like "thumbcache_*.db" -or $_.Name -like "iconcache_*.db") -and
+                            $_.Length -gt 0 -and $_.Length -lt 100MB
+                        }
+                        $pathSize = 0
+                        $pathFiles = 0
+                        if ($thumbFiles) {
+                            foreach ($file in $thumbFiles) {
+                                try {
+                                    $fileSize = $file.Length
+                                    Remove-Item $file.FullName -Force -ErrorAction Stop
+                                    $pathFiles++
+                                    $pathSize += $fileSize
+                                }
+                                catch {
+                                    # Skip locked
+                                }
+                            }
+                        }
+                        if ($pathFiles -gt 0) {
+                            $pathSizeMB = [Math]::Round($pathSize / 1MB, 1)
+                            Write-SimpleLog "User thumbnails for $($Profile.Name): $pathFiles files, $pathSizeMB MB"
+                        }
+                        $totalFiles += $pathFiles
+                        $totalSize += $pathSize
+                    }
+                    catch {
+                        Write-SimpleLog "Error processing thumbnails for $($Profile.Name): $($_.Exception.Message)"
+                    }
+                }
+            }
             $sizeMB = [Math]::Round($totalSize / 1MB, 1)
-            Write-SimpleLog "Thumbnail cleanup (non-Explorer): $totalFiles files, $sizeMB MB"
+            Write-SimpleLog "Thumbnail cleanup (all users): $totalFiles files, $sizeMB MB"
             return @{ Files = $totalFiles; Size = $totalSize }
         }
         catch {
-            Write-SimpleLog "Error in thumbnail cleanup: $($_.Exception.Message)"
+            Write-SimpleLog "Error in thumbnail cleanup (all users): $($_.Exception.Message)"
             return @{ Files = 0; Size = 0 }
         }
     }
-
     function Clear-WindowsUpgradeLogs {
         try {
             if (-not $AggressiveLogCleanup) {
                 Write-SimpleLog "Aggressive log cleanup disabled - skipping Windows upgrade logs"
                 return @{ Files = 0; Size = 0 }
             }
-            
             Write-SimpleLog "Targeting Windows upgrade logs with aggressive cleanup"
-            
             $totalSize = 0
             $totalFiles = 0
-            
             $upgradeLogPaths = @(
                 @{ Path = "$env:WINDIR\Logs\DPX"; Name = "Device Driver Install Logs"; AgeDays = 0; MaxSize = 10GB },
                 @{ Path = "$env:WINDIR\Logs\MoSetup"; Name = "Modern Setup Logs"; AgeDays = 0; MaxSize = 10GB },
@@ -2227,12 +1958,10 @@ $script:diskCleanupScriptBlock = {
                 @{ Path = "$env:WINDIR\System32\LogFiles\Srt"; Name = "System Restore Logs"; AgeDays = 0; MaxSize = 2GB },
                 @{ Path = "$env:WINDIR\inf"; Name = "INF Setup Logs"; AgeDays = 0; MaxSize = 5GB }
             )
-            
             foreach ($pathInfo in $upgradeLogPaths) {
                 if ($null -eq $pathInfo -or [string]::IsNullOrEmpty($pathInfo.Path) -or -not (Test-Path $pathInfo.Path)) {
                     continue
                 }
-                
                 try {
                     $logFiles = Get-ChildItem -Path $pathInfo.Path -Recurse -Force -ErrorAction SilentlyContinue |
                     Where-Object { 
@@ -2249,7 +1978,6 @@ $script:diskCleanupScriptBlock = {
                         $_.Length -gt 100 -and 
                         $_.Length -lt $pathInfo.MaxSize
                     }
-                    
                     # Special filters for specific paths
                     if ($pathInfo.Name -eq "INF Setup Logs") {
                         $logFiles = $logFiles | Where-Object { 
@@ -2257,10 +1985,8 @@ $script:diskCleanupScriptBlock = {
                             ($_.Name -like "*setup*" -or $_.Name -like "*install*" -or $_.Name -like "*oem*")
                         }
                     }
-                    
                     $pathSize = 0
                     $pathFiles = 0
-                    
                     if ($logFiles) {
                         foreach ($file in $logFiles) {
                             try {
@@ -2276,7 +2002,6 @@ $script:diskCleanupScriptBlock = {
                             }
                         }
                     }
-                    
                     if ($pathFiles -gt 0) {
                         $pathSizeMB = [Math]::Round($pathSize / 1MB, 1)
                         Write-SimpleLog "$($pathInfo.Name): $pathFiles files, $pathSizeMB MB"
@@ -2286,7 +2011,6 @@ $script:diskCleanupScriptBlock = {
                     Write-SimpleLog "Error processing $($pathInfo.Name): $($_.Exception.Message)"
                 }
             }
-            
             # Clean specific setup files
             try {
                 $setupFiles = @(
@@ -2297,7 +2021,6 @@ $script:diskCleanupScriptBlock = {
                     @{ Name = "setupapi.offline.log"; MaxSize = 2GB },
                     @{ Name = "setupapi.app.log"; MaxSize = 1GB }
                 )
-                
                 foreach ($setupFileInfo in $setupFiles) {
                     if ($null -ne $setupFileInfo -and -not [string]::IsNullOrEmpty($setupFileInfo.Name)) {
                         $filePath = Join-Path $env:WINDIR $setupFileInfo.Name
@@ -2322,7 +2045,6 @@ $script:diskCleanupScriptBlock = {
             catch {
                 Write-SimpleLog "Error cleaning setup logs: $($_.Exception.Message)"
             }
-            
             # Clean additional log paths
             try {
                 $additionalLogPaths = @(
@@ -2330,12 +2052,10 @@ $script:diskCleanupScriptBlock = {
                     "$env:WINDIR\System32\LogFiles",
                     "$env:WINDIR\SoftwareDistribution\DataStore\Logs"
                 )
-                
                 foreach ($logPath in $additionalLogPaths) {
                     if ([string]::IsNullOrWhiteSpace($logPath) -or -not (Test-Path $logPath)) {
                         continue
                     }
-                    
                     $oldLogs = Get-ChildItem -Path $logPath -Recurse -Force -ErrorAction SilentlyContinue |
                     Where-Object { 
                         -not $_.PSIsContainer -and 
@@ -2344,10 +2064,8 @@ $script:diskCleanupScriptBlock = {
                         $_.Length -lt 10GB -and
                         $_.LastWriteTime -lt (Get-Date).AddDays(-7)
                     }
-                    
                     $logSize = 0
                     $logCount = 0
-                    
                     if ($oldLogs) {
                         foreach ($file in $oldLogs) {
                             try {
@@ -2363,7 +2081,6 @@ $script:diskCleanupScriptBlock = {
                             }
                         }
                     }
-                    
                     if ($logCount -gt 0) {
                         $logSizeMB = [Math]::Round($logSize / 1MB, 1)
                         Write-SimpleLog "Additional logs from $logPath`: $logCount files, $logSizeMB MB"
@@ -2373,7 +2090,6 @@ $script:diskCleanupScriptBlock = {
             catch {
                 Write-SimpleLog "Error cleaning additional logs: $($_.Exception.Message)"
             }
-            
             $sizeMB = [Math]::Round($totalSize / 1MB, 1)
             if ($totalFiles -gt 0) {
                 Write-SimpleLog "Windows upgrade logs cleanup: $totalFiles files, $sizeMB MB"
@@ -2381,7 +2097,6 @@ $script:diskCleanupScriptBlock = {
             else {
                 Write-SimpleLog "Windows upgrade logs: No files found to clean"
             }
-            
             return @{ Files = $totalFiles; Size = $totalSize }
         }
         catch {
@@ -2389,28 +2104,22 @@ $script:diskCleanupScriptBlock = {
             return @{ Files = 0; Size = 0 }
         }
     }
-
     function Clear-ExplorerCaches {
         param(
             [Parameter(Mandatory = $true)]
             [ValidateNotNullOrEmpty()]
             [string]$JobId
         )
-        
         try {
             Write-SimpleLog "Clearing Explorer-locked caches during Explorer restart"
-            
             $totalSize = 0
             $totalFiles = 0
-            
             $explorerCacheFiles = [System.Collections.Generic.List[string]]::new()
             $explorerCacheFiles.Add("$env:LOCALAPPDATA\IconCache.db")
-            
             # Find additional Explorer caches
             try {
                 $additionalCaches = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\Windows\Explorer\*.db" -Force -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -match "(thumbcache|iconcache)_.*\.db$" }
-                
                 if ($additionalCaches) {
                     foreach ($cache in $additionalCaches) {
                         $explorerCacheFiles.Add($cache.FullName)
@@ -2420,14 +2129,12 @@ $script:diskCleanupScriptBlock = {
             catch {
                 Write-SimpleLog "Could not enumerate additional Explorer caches: $($_.Exception.Message)"
             }
-            
             # Remove cache files
             $cachesCleaned = 0
             foreach ($cacheFile in $explorerCacheFiles) {
                 if ([string]::IsNullOrWhiteSpace($cacheFile) -or -not (Test-Path $cacheFile)) {
                     continue
                 }
-                
                 try {
                     $file = Get-Item $cacheFile -Force
                     $fileSize = $file.Length
@@ -2442,7 +2149,6 @@ $script:diskCleanupScriptBlock = {
                     Write-SimpleLog "Could not remove cache: $(Split-Path $cacheFile -Leaf)"
                 }
             }
-            
             Write-SimpleLog "Explorer cache cleanup: $cachesCleaned caches cleared, $([Math]::Round($totalSize / 1MB, 1)) MB"
             return @{ Files = $totalFiles; Size = $totalSize }
         }
@@ -2451,24 +2157,19 @@ $script:diskCleanupScriptBlock = {
             return @{ Files = 0; Size = 0 }
         }
     }
-
     # Initialize script variables for the job
     $script:LogPath = $LogPath
     $script:JobId = $JobId
     $script:CleanupTimeoutSeconds = $CleanupTimeoutSeconds
     $script:AggressiveLogCleanup = $AggressiveLogCleanup
-    
     $script:loggedLockedFiles = @{}
-
     # Main cleanup execution
     try {
         Write-SimpleLog "Enhanced Windows 11 disk cleanup started with Job ID: $JobId"
         Write-SimpleLog "Configuration: CleanupTimeout=$CleanupTimeoutSeconds seconds, AggressiveLogCleanup=$AggressiveLogCleanup"
         Update-Progress -Percent 0 -Message "Starting enhanced cleanup..."
-        
         # Step 1: Detect available cleanup categories
         Update-Progress -Percent 5 -Message "Detecting available cleanup categories..."
-        
         try {
             $availableCategories = Get-AvailableCleanupCategories
             Write-SimpleLog "Available categories: $($availableCategories -join ', ')"
@@ -2477,10 +2178,8 @@ $script:diskCleanupScriptBlock = {
             Write-SimpleLog "Category detection failed: $($_.Exception.Message)"
             $availableCategories = @("Temporary Files", "Recycle Bin", "Temporary Internet Files", "Thumbnails", "Downloaded Program Files")
         }
-        
         # Step 2: Configure cleanup categories
         Update-Progress -Percent 10 -Message "Configuring $($availableCategories.Count) cleanup categories..."
-        
         $cleanupSuccess = $false
         try {
             $cleanupSuccess = Invoke-EnhancedCleanup -Categories $availableCategories -SageSet 65
@@ -2488,30 +2187,26 @@ $script:diskCleanupScriptBlock = {
         catch {
             Write-SimpleLog "Enhanced cleanup failed: $($_.Exception.Message)"
         }
-        
         Update-Progress -Percent 20 -Message "Registry cleanup configuration completed"
-        
         # Step 3: Windows.old handling
         $windowsOldPath = "C:\Windows.old"
         $windowsOldExists = Test-Path $windowsOldPath
         $windowsOldRemoved = $false
-        
         if ($windowsOldExists) {
             Update-Progress -Percent 25 -Message "Windows.old folder detected - requesting user decision..."
             Write-Output "WINDOWS_OLD_EXISTS:True"
             Write-Output "WINDOWS_OLD_PATH:$windowsOldPath"
-            
             # Wait for user decision
             $timeout = (Get-Date).AddSeconds(90)
             $decision = $null
             $checkCount = 0
-            
             while ((Get-Date) -lt $timeout -and $null -eq $decision) {
                 $userTempPath = [System.IO.Path]::GetTempPath()
-                $decisionFile = [System.IO.Path]::Combine($userTempPath, "RepairToolkit_${JobId}_WINDOWSOLD_DECISION.tmp")
-                
-                if (Test-Path $decisionFile) {
+                # Use wildcard pattern for random filename
+                $decisionFiles = Get-ChildItem -Path $userTempPath -Filter "RepairToolkit_${JobId}_WINDOWSOLD_DECISION_*.tmp" -ErrorAction SilentlyContinue
+                if ($decisionFiles) {
                     try {
+                        $decisionFile = $decisionFiles[0].FullName
                         $decision = Get-Content $decisionFile -Raw -ErrorAction SilentlyContinue
                         Remove-Item $decisionFile -Force -ErrorAction SilentlyContinue
                         if ($null -ne $decision) {
@@ -2524,19 +2219,16 @@ $script:diskCleanupScriptBlock = {
                         Write-SimpleLog "Error reading decision file: $($_.Exception.Message)"
                     }
                 }
-                
                 $checkCount++
                 if ($checkCount % 10 -eq 0) {
                     Write-SimpleLog "Waiting for Windows.old decision... (check $checkCount)"
                 }
                 Start-Sleep -Seconds 2
             }
-            
             if ($decision -eq "YES") {
                 Update-Progress -Percent 30 -Message "Removing Windows.old folder..."
                 try {
                     $windowsOldRemoved = Remove-WindowsOld -WindowsOldPath $windowsOldPath
-                    
                     if ($windowsOldRemoved) {
                         Update-Progress -Percent 35 -Message "Windows.old folder successfully removed"
                     }
@@ -2556,42 +2248,31 @@ $script:diskCleanupScriptBlock = {
         else {
             Update-Progress -Percent 35 -Message "No Windows.old folder detected"
         }
-        
         Update-Progress -Percent 40 -Message "Windows.old processing completed"
-        
         # Step 4: Run targeted cleanup operations
         Update-Progress -Percent 45 -Message "Running Microsoft Defender cleanup..."
         $defenderResult = Clear-DefenderFiles
-        
         Update-Progress -Percent 50 -Message "Running Delivery Optimization cleanup..."
         $deliveryResult = Clear-DeliveryOptimization
-        
         Update-Progress -Percent 55 -Message "Running Internet temporary files cleanup..."
         $internetResult = Clear-InternetTemporaryFiles
-        
         Update-Progress -Percent 60 -Message "Running system temporary files cleanup..."
         $tempResult = Clear-SystemTemporaryFiles
-        
         Update-Progress -Percent 65 -Message "Running thumbnails cleanup..."
         $thumbResult = Clear-ThumbnailFiles
-        
         Update-Progress -Percent 67 -Message "Running Windows upgrade logs cleanup..."
         $upgradeResult = Clear-WindowsUpgradeLogs
-        
         # Calculate total cleaned
         $customCleanupTotal = $defenderResult.Size + $deliveryResult.Size + $internetResult.Size + 
                               $tempResult.Size + $thumbResult.Size + $upgradeResult.Size
         $customCleanupMB = [Math]::Round($customCleanupTotal / 1MB, 1)
-        
         # Step 5: Run native Windows cleanup as fallback if needed
         if ($customCleanupMB -lt 50 -and $cleanupSuccess) {
             Update-Progress -Percent 68 -Message "Running native Windows cleanup as fallback..."
             try {
                 Write-SimpleLog "Custom cleanup only freed $customCleanupMB MB, running native cleanmgr"
-                
                 $cleanmgrProcess = Start-Process -FilePath "cleanmgr.exe" -ArgumentList "/SAGERUN:65" -WindowStyle Hidden -PassThru -ErrorAction Stop
                 $cleanmgrCompleted = $cleanmgrProcess.WaitForExit(($CleanupTimeoutSeconds / 2) * 1000)
-                
                 if ($cleanmgrCompleted) {
                     Write-SimpleLog "Native cleanup completed with exit code: $($cleanmgrProcess.ExitCode)"
                 }
@@ -2609,50 +2290,42 @@ $script:diskCleanupScriptBlock = {
                 Write-SimpleLog "Native cleanup fallback failed: $($_.Exception.Message)"
             }
         }
-        
         Update-Progress -Percent 70 -Message "Targeted cleanup phases completed"
-        
         # Step 6: Network optimization
         Update-Progress -Percent 75 -Message "Optimizing system performance..."
-        
         try {
             $dnsResult = & ipconfig /flushdns 2>&1
             $winsockResult = & netsh winsock reset 2>&1
-            
             if ($dnsResult -match "Successfully flushed") {
                 Write-SimpleLog "DNS cache flushed successfully"
             }
             else {
                 Write-SimpleLog "DNS flush result: $dnsResult"
             }
-            
             if ($winsockResult -match "successfully") {
                 Write-SimpleLog "Winsock reset completed successfully"
             }
             else {
                 Write-SimpleLog "Winsock reset result: $winsockResult"
             }
-            
             Write-SimpleLog "Network optimization completed"
         }
         catch {
             Write-SimpleLog "Network optimization failed: $($_.Exception.Message)"
         }
-        
         # Step 7: Explorer restart for visual optimization
         Update-Progress -Percent 85 -Message "Preparing visual performance optimization..."
         Write-Output "EXPLORER_RESTART_REQUEST:True"
-        
         # Wait for Explorer restart decision
         $timeout = (Get-Date).AddSeconds(120)
         $explorerDecision = $null
-        
         while ((Get-Date) -lt $timeout -and $null -eq $explorerDecision) {
             $userTempPath = [System.IO.Path]::GetTempPath()
-            $explorerFile = [System.IO.Path]::Combine($userTempPath, "RepairToolkit_${JobId}_EXPLORER_RESTART.tmp")
-            
-            if (Test-Path $explorerFile) {
+            # Use wildcard for random filename
+            $explorerFiles = Get-ChildItem -Path $userTempPath -Filter "RepairToolkit_${JobId}_EXPLORER_RESTART_*.tmp" -ErrorAction SilentlyContinue
+            if ($explorerFiles) {
                 try {
+                    $explorerFile = $explorerFiles[0].FullName
                     $explorerDecision = Get-Content $explorerFile -Raw -ErrorAction SilentlyContinue
                     Remove-Item $explorerFile -Force -ErrorAction SilentlyContinue
                     if ($null -ne $explorerDecision) {
@@ -2666,29 +2339,22 @@ $script:diskCleanupScriptBlock = {
             }
             Start-Sleep -Seconds 1
         }
-        
         $explorerCacheResult = @{ Files = 0; Size = 0 }
-        
         if ($explorerDecision -eq "YES") {
             Update-Progress -Percent 87 -Message "Restarting Explorer for visual optimization..."
             try {
                 # Stop Explorer
                 Stop-Process -Name "explorer" -Force -ErrorAction SilentlyContinue
-                
                 $explorerStopped = Wait-ProcessStop -ProcessName "explorer" -TimeoutSeconds 15
                 if ($explorerStopped) {
                     Write-SimpleLog "Explorer stopped successfully"
                 }
-                
                 Start-Sleep -Seconds 2
-                
                 # Clear Explorer caches
                 $explorerCacheResult = Clear-ExplorerCaches -JobId $JobId
-                
                 # Restart Explorer
                 Start-Process "explorer.exe" -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 2
-                
                 $explorerRunning = Get-Process -Name "explorer" -ErrorAction SilentlyContinue
                 if ($explorerRunning) {
                     Update-Progress -Percent 90 -Message "Visual performance optimized"
@@ -2698,7 +2364,6 @@ $script:diskCleanupScriptBlock = {
             catch {
                 Write-SimpleLog "Explorer restart failed: $($_.Exception.Message)"
                 Update-Progress -Percent 90 -Message "Visual optimization completed with issues"
-                
                 # Fallback Explorer restart
                 try {
                     Start-Process "explorer.exe" -ErrorAction SilentlyContinue
@@ -2711,28 +2376,23 @@ $script:diskCleanupScriptBlock = {
         else {
             Update-Progress -Percent 90 -Message "Visual optimization skipped"
         }
-        
         # Finalize
         $jobDuration = (Get-Date) - $jobStartTime
         Update-Progress -Percent 100 -Message "Enhanced cleanup and optimization completed!"
-        
         # Calculate totals
         $totalFiles = $defenderResult.Files + $deliveryResult.Files + $internetResult.Files + 
                       $tempResult.Files + $thumbResult.Files + $upgradeResult.Files + $explorerCacheResult.Files
         $totalSize = $defenderResult.Size + $deliveryResult.Size + $internetResult.Size + 
                      $tempResult.Size + $thumbResult.Size + $upgradeResult.Size + $explorerCacheResult.Size
         $totalSizeMB = [Math]::Round($totalSize / 1MB, 1)
-        
         # Log summary
         Write-SimpleLog "=== TARGETED CLEANUP SUMMARY ==="
         Write-SimpleLog "Registry cleanup success: $cleanupSuccess"
         Write-SimpleLog "TOTAL TARGETED CLEANUP: $totalFiles files, $totalSizeMB MB freed"
         $durationText = "{0:D2}:{1:D2}" -f [int][Math]::Floor($jobDuration.TotalMinutes), [int]$jobDuration.Seconds
         Write-SimpleLog "Targeted cleanup completed in $durationText"
-        
         # Check if Windows.old was actually removed
         $windowsOldFinallyRemoved = $windowsOldExists -and $windowsOldRemoved -and (-not (Test-Path $windowsOldPath))
-        
         # Output final result
         Write-Output "FINAL_RESULT_START"
         Write-Output ([PSCustomObject]@{
@@ -2758,16 +2418,13 @@ $script:diskCleanupScriptBlock = {
             CompletedTasks            = "Registry cleanup, Windows.old removal, targeted cleanup, network optimization, visual optimization"
         })
         Write-Output "FINAL_RESULT_END"
-        
         Write-SimpleLog "Targeted cleanup job completed successfully"
-        
     }
     catch {
         $jobDuration = (Get-Date) - $jobStartTime
         $errorMessage = "Critical error in targeted cleanup: $($_.Exception.Message)"
         Write-SimpleLog $errorMessage
         Write-Output "PROGRESS_LINE:ERROR: $errorMessage"
-        
         Write-Output "FINAL_RESULT_START"
         Write-Output ([PSCustomObject]@{ 
             ExitCode      = -999
@@ -2779,7 +2436,6 @@ $script:diskCleanupScriptBlock = {
     }
 }
 #endregion
-
 #region 9. Job Management Functions - Background Job Control
 function Start-RepairJob {
     [CmdletBinding()]
@@ -2787,19 +2443,15 @@ function Start-RepairJob {
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$JobName,
-        
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$Executable,
-        
         [Parameter(Mandatory = $true)]
         [ValidateNotNull()]
         [string]$Arguments,
-        
         [Parameter()]
         [string]$InitialStatus = "Operation in progress..."
     )
-    
     # Check if another job is running
     if ($null -ne $script:currentRepairJob) {
         $message = "Another repair operation is already in progress. Please wait for it to complete."
@@ -2807,7 +2459,6 @@ function Start-RepairJob {
         Write-RepairLog -Message "Job start blocked: Another job is running" -Category "WARNING"
         return $false
     }
-    
     # Validate executable exists
     $executableFound = $false
     if (Test-Path $Executable -PathType Leaf) {
@@ -2822,17 +2473,14 @@ function Start-RepairJob {
             $executableFound = $false
         }
     }
-    
     if (-not $executableFound) {
         $message = "Executable not found: $Executable"
         Show-ErrorMessage -Message $message
         Write-RepairLog -Message "Job start failed: Executable not found: $Executable" -Category "ERROR"
         return $false
     }
-    
     Write-RepairLog -Message "Starting repair job: $JobName" -Category "JOB"
     Update-UiForJobStart -StatusMessage $InitialStatus
-    
     # Reset job state
     $script:operationStartTime = Get-Date
     $script:progressMessageCount = 0
@@ -2841,11 +2489,9 @@ function Start-RepairJob {
     $script:progressCommunicationFailures = 0
     $script:lastFallbackLogTime = [DateTime]::MinValue
     $script:lastProgressUpdate = Get-Date
-    
     try {
-        # Start background job
-        $script:currentRepairJob = Start-Job -Name $JobName -ScriptBlock $script:commandRunnerScriptBlock -ArgumentList $Executable, $Arguments
-        
+        # Add -RunAs32:$false to avoid 32-bit memory limits
+        $script:currentRepairJob = Start-Job -Name $JobName -ScriptBlock $script:commandRunnerScriptBlock -ArgumentList $Executable, $Arguments -RunAs32:$false
         if ($null -ne $script:currentRepairJob) {
             # Track job in collection
             $jobInfo = @{
@@ -2855,10 +2501,8 @@ function Start-RepairJob {
                 Executable = $Executable
             }
             $script:jobCollection.TryAdd($script:currentRepairJob.Id.ToString(), $jobInfo) | Out-Null
-            
             Write-RepairLog -Message "Job started with ID: $($script:currentRepairJob.Id)" -Category "JOB"
         }
-        
         # Start progress monitoring
         Start-ProgressTimer
         Write-RepairLog -Message "Background job started successfully" -Category "JOB"
@@ -2870,66 +2514,52 @@ function Start-RepairJob {
         return $false
     }
 }
-
 function Start-DISMRepair {
     [CmdletBinding()]
     param()
-    
     if (-not (Confirm-AdminOrFail -OperationName "DISM System Image Repair")) { 
         return 
     }
-    
     Write-OperationStart -OperationType "DISM"
     $result = Start-RepairJob -JobName "DISMRepairJob" `
                               -Executable "DISM.exe" `
                               -Arguments "/Online /Cleanup-Image /RestoreHealth" `
                               -InitialStatus "DISM Repair in progress... 0%"
-    
     if (-not $result) {
         Write-RepairLog -Message "DISM repair job failed to start" -Category "ERROR" -Operation "DISM"
         Write-OperationEnd -OperationType "DISM" -Success $false -ExitCode -1
     }
 }
-
 function Start-SFCRepair {
     [CmdletBinding()]
     param()
-    
     if (-not (Confirm-AdminOrFail -OperationName "SFC System File Check")) { 
         return 
     }
-    
     Write-OperationStart -OperationType "SFC"
     $result = Start-RepairJob -JobName "SFCRepairJob" `
                               -Executable "sfc.exe" `
                               -Arguments "/scannow" `
                               -InitialStatus "SFC Scan in progress... 0%"
-    
     if (-not $result) {
         Write-RepairLog -Message "SFC repair job failed to start" -Category "ERROR" -Operation "SFC"
         Write-OperationEnd -OperationType "SFC" -Success $false -ExitCode -1
     }
 }
-
 function Start-DiskCleanup {
     [CmdletBinding()]
     param()
-    
     if (-not (Confirm-AdminOrFail -OperationName "Comprehensive System Cleanup")) { 
         return 
     }
-    
     # Check if another job is running
     if ($null -ne $script:currentRepairJob) {
         $message = "Another repair operation is already in progress."
         Show-WarningMessage -Message $message
         return
     }
-    
     Write-OperationStart -OperationType "CLEANUP"
-    
     Update-UiForJobStart -StatusMessage "System Optimization in progress... 0%"
-    
     # Initialize cleanup job state
     $script:operationStartTime = Get-Date
     $script:progressMessageCount = 0
@@ -2940,15 +2570,13 @@ function Start-DiskCleanup {
     $script:progressCommunicationFailures = 0
     $script:lastProgressUpdate = Get-Date
     $script:lastFallbackLogTime = [DateTime]::MinValue
-    
     Write-RepairLog -Message "Cleanup operation initialized with Job ID: $script:currentJobId" -Category "JOB" -Operation "CLEANUP"
-    
     try {
-        # Start cleanup job with parameters
+        # Add -RunAs32:$false
         $script:currentRepairJob = Start-Job -Name "DiskCleanupJob" `
                                              -ScriptBlock $script:diskCleanupScriptBlock `
-                                             -ArgumentList $script:logPath, $script:currentJobId, 300, $false
-        
+                                             -ArgumentList $script:logPath, $script:currentJobId, 300, $false `
+                                             -RunAs32:$false
         if ($null -ne $script:currentRepairJob) {
             # Track job in collection
             $jobInfo = @{
@@ -2958,10 +2586,8 @@ function Start-DiskCleanup {
                 JobId = $script:currentJobId
             }
             $script:jobCollection.TryAdd($script:currentRepairJob.Id.ToString(), $jobInfo) | Out-Null
-            
             Write-RepairLog -Message "Cleanup job started with ID: $($script:currentRepairJob.Id)" -Category "JOB"
         }
-        
         # Start progress monitoring
         Start-ProgressTimer
         Write-RepairLog -Message "Cleanup background job started successfully" -Category "JOB" -Operation "CLEANUP"
@@ -2972,47 +2598,38 @@ function Start-DiskCleanup {
         Write-OperationEnd -OperationType "CLEANUP" -Success $false -ExitCode -1
     }
 }
-
 function Start-ProgressTimer {
     [CmdletBinding()]
     param()
-    
     try {
         # Stop existing timer if any
         Stop-ProgressTimer
-        
         # Check if form is valid
         if ($null -ne $script:form -and ($script:form.IsDisposed -or $script:form.Disposing)) {
             Write-RepairLog -Message "Cannot start timer - form is disposed" -Category "WARNING"
             return
         }
-        
         # Create new timer
         $script:progressUpdateTimer = New-Object System.Windows.Forms.Timer
         $script:progressUpdateTimer.Interval = $script:CONSTANTS.TIMER_INTERVAL_MS
         $script:progressUpdateTimer.Add_Tick($script:progressTimerAction)
         $script:progressUpdateTimer.Start()
-        
         Write-RepairLog -Message "Progress timer started with interval: $($script:CONSTANTS.TIMER_INTERVAL_MS)ms" -Category "JOB"
     }
     catch {
         Write-RepairLog -Message "Failed to start progress timer: $($_.Exception.Message)" -Category "ERROR"
     }
 }
-
 function Stop-ProgressTimer {
     [CmdletBinding()]
     param()
-    
+    # Use a lock to prevent race conditions between the timer tick and disposal.
+    [System.Threading.Monitor]::Enter($script:timerLock)
     try {
         if ($null -ne $script:progressUpdateTimer) {
             Write-RepairLog -Message "Stopping progress timer" -Category "JOB"
-            
-            # Store reference and clear script variable immediately
             $timerToStop = $script:progressUpdateTimer
             $script:progressUpdateTimer = $null
-            
-            # Stop timer
             try {
                 if ($timerToStop.Enabled) {
                     $timerToStop.Stop()
@@ -3021,23 +2638,18 @@ function Stop-ProgressTimer {
             catch {
                 Write-RepairLog -Message "Error stopping timer: $($_.Exception.Message)" -Category "WARNING"
             }
-            
-            # Remove event handler
             try {
                 $timerToStop.Remove_Tick($script:progressTimerAction)
             }
             catch {
                 Write-RepairLog -Message "Error removing timer event: $($_.Exception.Message)" -Category "WARNING"
             }
-            
-            # Dispose timer
             try {
                 $timerToStop.Dispose()
             }
             catch {
                 Write-RepairLog -Message "Error disposing timer: $($_.Exception.Message)" -Category "WARNING"
             }
-            
             Write-RepairLog -Message "Progress timer stopped and disposed" -Category "JOB"
         }
     }
@@ -3045,15 +2657,15 @@ function Stop-ProgressTimer {
         Write-RepairLog -Message "Error stopping progress timer: $($_.Exception.Message)" -Category "WARNING"
         $script:progressUpdateTimer = $null
     }
+    finally {
+        [System.Threading.Monitor]::Exit($script:timerLock)
+    }
 }
-
 function Stop-AllJobs {
     [CmdletBinding()]
     param()
-    
     try {
         Write-RepairLog -Message "Stopping all running jobs" -Category "JOB"
-        
         # Stop current job if running
         if ($null -ne $script:currentRepairJob) {
             if ($script:currentRepairJob.State -eq 'Running') {
@@ -3063,7 +2675,6 @@ function Stop-AllJobs {
             $script:currentRepairJob | Remove-Job -ErrorAction SilentlyContinue
             $script:currentRepairJob = $null
         }
-        
         # Clear job collection
         foreach ($jobId in $script:jobCollection.Keys) {
             $jobInfo = $null
@@ -3082,10 +2693,8 @@ function Stop-AllJobs {
             }
         }
         $script:jobCollection.Clear()
-        
         # Clear communication files
         Clear-JobCommunicationFiles
-        
         Write-RepairLog -Message "All jobs stopped" -Category "JOB"
     }
     catch {
@@ -3093,45 +2702,42 @@ function Stop-AllJobs {
     }
 }
 #endregion
-
 #region 10. Progress Timer and Job Processing - Real-time Progress Monitoring
 $script:progressTimerAction = {
+    # Use a lock to ensure the timer logic doesn't run while the timer is being disposed.
+    if (-not [System.Threading.Monitor]::TryEnter($script:timerLock, 100)) {
+        return
+    }
     try {
-        # Basic validation
+        # EARLY EXIT: Validate form and job state to prevent null-ref errors
         if ($null -eq $script:currentRepairJob -or 
             $null -eq $script:form -or $script:form.IsDisposed) {
             Stop-ProgressTimer
             return
         }
-        
-        # Check job state first
+
+        # Check job completion
         $jobState = $script:currentRepairJob.State
-        
         if ($jobState -ne [System.Management.Automation.JobState]::Running) {
             Write-RepairLog -Message "Job completed, state: $jobState" -Category "JOB"
             Complete-JobExecution
             return
         }
-        
-        # Simplified and more reliable job output reading
+
+        # Process new job output
         $hasNewProgress = $false
         if ($script:currentRepairJob.HasMoreData) {
             try {
-                # Use a safer approach with proper error handling
                 $newOutput = @()
-                
-                # Try to receive new output without -Keep to avoid conflicts
                 try {
                     $allOutput = @(Receive-Job -Job $script:currentRepairJob -Keep -ErrorAction Stop)
-                    
-                    # Only process new output since last check
                     if ($allOutput.Count -gt $script:lastOutputCount) {
                         $newOutput = $allOutput[$script:lastOutputCount..($allOutput.Count - 1)]
                         $script:lastOutputCount = $allOutput.Count
                     }
                 }
                 catch {
-                    # If -Keep fails, try without it and track differently
+                    # Fallback without -Keep if stream conflict occurs
                     try {
                         $freshOutput = @(Receive-Job -Job $script:currentRepairJob -ErrorAction Stop)
                         if ($freshOutput.Count -gt 0) {
@@ -3139,30 +2745,28 @@ $script:progressTimerAction = {
                         }
                     }
                     catch {
-                        # Complete failure - continue to fallback progress
+                        # Silent failure; rely on fallback progress
                     }
                 }
-                
+
                 if ($newOutput.Count -gt 0) {
                     $hasNewProgress = Invoke-NewJobOutput -Output $newOutput
                 }
             }
             catch {
-                # Only log unexpected errors, not stream conflicts
                 if ($_.Exception.Message -notlike "*stream*" -and $_.Exception.Message -notlike "*use*") {
                     Write-RepairLog -Message "Timer output warning: $($_.Exception.Message)" -Category "DEBUG"
                 }
             }
         }
-        
-        # Calculate runtime for fallback progress
+
+        # Fallback progress estimation if no real updates
         $jobRuntime = if ($script:operationStartTime -ne [DateTime]::MinValue) { 
             (Get-Date) - $script:operationStartTime 
         } else { 
             New-TimeSpan 
         }
-        
-        # Enable fallback progress if no updates for a while
+
         if (-not $hasNewProgress -and $jobRuntime.TotalSeconds -gt 30) {
             if (-not $script:fallbackProgressEnabled) {
                 $script:fallbackProgressEnabled = $true
@@ -3171,10 +2775,9 @@ $script:progressTimerAction = {
             }
             Update-FallbackProgress
         }
-        
-        # Update status display
+
+        # Update status display (throttled)
         Update-StatusDisplay
-        
     }
     catch {
         Write-RepairLog -Message "Timer error: $($_.Exception.Message)" -Category "ERROR"
@@ -3185,21 +2788,21 @@ $script:progressTimerAction = {
             }
         }
         catch {
-            # Final fallback
+            # Final fallback – do not throw
         }
     }
+    finally {
+        [System.Threading.Monitor]::Exit($script:timerLock)
+    }
 }
-
 function Update-FallbackProgress {
     if ($script:operationStartTime -eq [DateTime]::MinValue) { return }
-    
     $elapsed = (Get-Date) - $script:operationStartTime
     $jobDisplayName = if ($null -ne $script:currentRepairJob) {
         Get-JobDisplayName -JobName $script:currentRepairJob.Name
     } else {
         "Operation"
     }
-    
     # Calculate estimated progress based on job type and elapsed time
     $estimatedProgress = switch ($jobDisplayName) {
         "DISM Repair" {
@@ -3219,9 +2822,7 @@ function Update-FallbackProgress {
             [Math]::Min(($elapsed.TotalMinutes / 10) * 95, 95)
         }
     }
-    
     $estimatedProgress = [int]$estimatedProgress
-    
     # Calculate time since last update
     $timeSinceLastUpdate = if ($script:lastProgressUpdate -ne [DateTime]::MinValue) { 
         (Get-Date) - $script:lastProgressUpdate 
@@ -3229,33 +2830,40 @@ function Update-FallbackProgress {
     else { 
         $elapsed 
     }
-    
     # Update progress if significant time has passed
     if ($timeSinceLastUpdate.TotalSeconds -gt 45 -and $estimatedProgress -gt 0) {
         try {
             if ($null -ne $script:progressBar -and -not $script:progressBar.IsDisposed) {
                 $currentValue = $script:progressBar.Value
-                
                 # Only apply fallback progress if reasonable
                 if (($estimatedProgress -gt $currentValue -or $currentValue -eq 0) -and 
                     $estimatedProgress -le ($currentValue + 10)) {
-                    
-                    # Use the safe update function
-                    Update-ProgressBarSafe -Percent $estimatedProgress
+                    # Use synchronous Invoke to catch exceptions
+                    if ($script:progressBar.InvokeRequired) {
+                        try {
+                            $script:progressBar.Invoke([Action]{
+                                if (-not $script:progressBar.IsDisposed) {
+                                    $script:progressBar.Value = $estimatedProgress
+                                }
+                            })
+                        }
+                        catch {
+                            Write-RepairLog -Message "Invoke failed in fallback progress: $($_.Exception.Message)" -Category "ERROR"
+                        }
+                    }
+                    else {
+                        $script:progressBar.Value = $estimatedProgress
+                    }
                 }
-                
                 # Improved logging to reduce spam
                 $currentTime = Get-Date
-                
                 # Initialize lastFallbackEnableLog if not exists
                 if (-not (Get-Variable -Name 'lastFallbackEnableLog' -Scope Script -ErrorAction SilentlyContinue)) {
                     $script:lastFallbackEnableLog = [DateTime]::MinValue
                 }
-                
                 # Only log fallback progress periodically (every 30 seconds)
                 if ($script:lastFallbackLogTime -eq [DateTime]::MinValue -or 
                     ($currentTime - $script:lastFallbackLogTime).TotalSeconds -gt 30) {
-                    
                     # Check if we need to log the initial enable message
                     if (-not $script:fallbackProgressEnabled) {
                         $script:fallbackProgressEnabled = $true
@@ -3268,12 +2876,10 @@ function Update-FallbackProgress {
                         Write-RepairLog -Message "Fallback progress active: $estimatedProgress% (estimated)" -Category "DEBUG"
                         $script:lastFallbackEnableLog = $currentTime
                     }
-                    
                     # Log the actual progress percentage every 30 seconds
                     if ($estimatedProgress -ne $currentValue) {
                         Write-RepairLog -Message "Fallback progress: $estimatedProgress% (estimated)" -Category "INFO"
                     }
-                    
                     $script:lastFallbackLogTime = $currentTime
                 }
             }
@@ -3283,44 +2889,62 @@ function Update-FallbackProgress {
         }
     }
 }
-
 function Complete-JobExecution {
     try {
-        # Stop timer first to prevent race conditions
+        # STOP TIMER FIRST to prevent race conditions during UI updates
         Stop-ProgressTimer
-        
-        # Validate form
+
+        # EARLY EXIT if form is gone
         if ($null -eq $script:form -or $script:form.IsDisposed) {
+            Write-RepairLog -Message "Form is disposed - skipping UI updates" -Category "WARNING"
+            # Still clean up job state
+            if ($null -ne $script:currentRepairJob) {
+                try {
+                    if ($script:currentRepairJob.State -eq 'Running') {
+                        $script:currentRepairJob | Stop-Job -ErrorAction SilentlyContinue
+                    }
+                    Remove-Job $script:currentRepairJob -Force -ErrorAction SilentlyContinue
+                }
+                catch {
+                    Write-RepairLog -Message "Error cleaning up orphaned job" -Category "WARNING"
+                }
+                $script:currentRepairJob = $null
+            }
+            Reset-JobState
             return
         }
-        
-        # Get job reference
+
+        # Capture and clear current job
         $jobToProcess = $script:currentRepairJob
         $script:currentRepairJob = $null
-        
+
         if ($null -eq $jobToProcess) {
             Write-RepairLog -Message "No job to complete" -Category "WARNING"
             return
         }
-        
+
         Write-RepairLog -Message "Completing job: $($jobToProcess.Name) (State: $($jobToProcess.State))" -Category "JOB"
-        
-        # Give the job a moment to finish writing output
+
+        # Allow job to flush final output
         Start-Sleep -Milliseconds 500
-        
-        # Get final result - try captured result first, then fetch from job
+
+        # Retrieve result
         $jobResult = $script:capturedJobResult
         if ($null -eq $jobResult) {
             Write-RepairLog -Message "Getting result from job output" -Category "JOB"
             $jobResult = Get-JobResult -Job $jobToProcess
         }
-        
-        # Update progress to 100% if successful
+
+        # Set progress to 100% on success
         if ($null -ne $jobResult -and $jobResult.ExitCode -eq 0) {
             try {
                 if ($null -ne $script:progressBar -and -not $script:progressBar.IsDisposed) {
                     if ($script:progressBar.InvokeRequired) {
-                        $script:progressBar.Invoke([Action]{ $script:progressBar.Value = 100 })
+                        $script:progressBar.Invoke([Action]{ 
+                            if (-not $script:progressBar.IsDisposed) { 
+                                $script:progressBar.Value = 100 
+                            } 
+                        })
                     } else {
                         $script:progressBar.Value = 100
                     }
@@ -3330,30 +2954,25 @@ function Complete-JobExecution {
                 Write-RepairLog -Message "Final progress update failed: $($_.Exception.Message)" -Category "WARNING"
             }
         }
-        
-        # Process job completion
+
+        # Delegate to job-specific completion handler
         Complete-RepairJob -Job $jobToProcess -JobResult $jobResult
-        
-        # Cleanup job
+
+        # Final job cleanup
         try {
             if ($jobToProcess.State -eq 'Running') {
                 $jobToProcess | Stop-Job -ErrorAction SilentlyContinue
                 Start-Sleep -Milliseconds 200
             }
-            
-            # Remove from collection first
             $script:jobCollection.TryRemove($jobToProcess.Id.ToString(), [ref]$null) | Out-Null
-            
-            # Final cleanup
             Remove-Job $jobToProcess -Force -ErrorAction SilentlyContinue
         }
         catch {
             Write-RepairLog -Message "Job cleanup warning: $($_.Exception.Message)" -Category "WARNING"
         }
-        
-        # Reset state
+
+        # Reset global job state
         Reset-JobState
-        
         Write-RepairLog -Message "Job completion finished" -Category "JOB"
     }
     catch {
@@ -3368,16 +2987,13 @@ function Complete-JobExecution {
         }
     }
 }
-
 function Invoke-NewJobOutput {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [array]$Output
     )
-    
     $hasProgress = $false
-    
     try {
         # Look for result object first
         if ($null -eq $script:capturedJobResult) {
@@ -3385,25 +3001,20 @@ function Invoke-NewJobOutput {
                 $_ -is [PSCustomObject] -and 
                 ($null -ne $_.PSObject.Properties['JobType'] -or $null -ne $_.PSObject.Properties['ExitCode'])
             } | Select-Object -First 1
-            
             if ($null -ne $resultObject) {
                 $script:capturedJobResult = $resultObject
             }
         }
-        
         # Better output processing with detailed logging
         foreach ($item in $Output) {
             if ($null -eq $item) { continue }
-            
             # Skip result objects
             if ($item -is [PSCustomObject] -and 
                 ($null -ne $item.PSObject.Properties['JobType'] -or $null -ne $item.PSObject.Properties['ExitCode'])) {
                 continue
             }
-            
             $itemStr = $item.ToString().Trim()
             if ([string]::IsNullOrWhiteSpace($itemStr)) { continue }
-            
             # More detailed progress line processing
             if ($itemStr.StartsWith("PROGRESS_LINE:", [System.StringComparison]::OrdinalIgnoreCase)) {
                 Write-RepairLog -Message "Processing progress line: $itemStr" -Category "DEBUG"
@@ -3411,33 +3022,44 @@ function Invoke-NewJobOutput {
                 $hasProgress = $true
             }
             elseif ($itemStr.StartsWith("WINDOWS_OLD_EXISTS:", [System.StringComparison]::OrdinalIgnoreCase)) {
-                # Better UI thread scheduling
+                # Stop timer before showing modal dialog
+                $wasTimerRunning = $false
+                if ($null -ne $script:progressUpdateTimer -and $script:progressUpdateTimer.Enabled) {
+                    Stop-ProgressTimer
+                    $wasTimerRunning = $true
+                }
                 if ($null -ne $script:form -and -not $script:form.IsDisposed) {
                     try {
-                        $script:form.BeginInvoke([Action]{
-                            Show-WindowsOldPrompt
-                        })
+                        Show-WindowsOldPrompt
                     }
                     catch {
-                        Write-RepairLog -Message "Error scheduling Windows.old prompt: $($_.Exception.Message)" -Category "ERROR"
+                        Write-RepairLog -Message "Error showing Windows.old prompt: $($_.Exception.Message)" -Category "ERROR"
                     }
+                }
+                if ($wasTimerRunning) {
+                    Start-ProgressTimer
                 }
             }
             elseif ($itemStr.StartsWith("EXPLORER_RESTART_REQUEST:", [System.StringComparison]::OrdinalIgnoreCase)) {
-                # Better UI thread scheduling
+                # Stop timer before showing modal dialog
+                $wasTimerRunning = $false
+                if ($null -ne $script:progressUpdateTimer -and $script:progressUpdateTimer.Enabled) {
+                    Stop-ProgressTimer
+                    $wasTimerRunning = $true
+                }
                 if ($null -ne $script:form -and -not $script:form.IsDisposed) {
                     try {
-                        $script:form.BeginInvoke([Action]{
-                            Show-ExplorerRestartPrompt
-                        })
+                        Show-ExplorerRestartPrompt
                     }
                     catch {
-                        Write-RepairLog -Message "Error scheduling Explorer restart prompt: $($_.Exception.Message)" -Category "ERROR"
+                        Write-RepairLog -Message "Error showing Explorer restart prompt: $($_.Exception.Message)" -Category "ERROR"
                     }
+                }
+                if ($wasTimerRunning) {
+                    Start-ProgressTimer
                 }
             }
         }
-        
         return $hasProgress
     }
     catch {
@@ -3445,34 +3067,28 @@ function Invoke-NewJobOutput {
         return $false
     }
 }
-
 function Update-ProgressLine {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [string]$Line
     )
-    
     try {
         # Extract progress content
         if (-not $Line.StartsWith("PROGRESS_LINE:", [System.StringComparison]::OrdinalIgnoreCase)) {
             return
         }
-        
         $progressContent = $Line.Substring("PROGRESS_LINE:".Length).Trim()
         if ([string]::IsNullOrWhiteSpace($progressContent)) {
             return
         }
-        
         # Update last progress time and disable fallback
         $script:lastProgressUpdate = Get-Date
         $script:fallbackProgressEnabled = $false
-        
-        # FIXED: Improved percentage extraction with better regex
+        # Improved percentage extraction with better regex
         $percentMatch = $null
         $percentPattern = '^(\d{1,3})(?:\.(\d+))?%'
         $regexResult = [regex]::Match($progressContent, $percentPattern)
-        
         if ($regexResult.Success) {
             $wholeNumber = [int]$regexResult.Groups[1].Value
             $decimalPart = if ($regexResult.Groups[2].Success) { 
@@ -3480,7 +3096,6 @@ function Update-ProgressLine {
             } else { 
                 0 
             }
-            
             # Handle decimal properly - if decimal >= 5, round up
             $percentMatch = if ($decimalPart -ge 5 -and $wholeNumber -lt 100) { 
                 $wholeNumber + 1 
@@ -3496,15 +3111,41 @@ function Update-ProgressLine {
                 $percentMatch = [int]$simpleResult.Groups[1].Value
             }
         }
-        
         if ($null -ne $percentMatch) {
             $percent = [int]$percentMatch
             if ($percent -ge 0 -and $percent -le 100) {
-                # Synchronous UI update with proper thread safety
-                Update-ProgressBarSafe -Percent $percent
+                # Use synchronous Invoke
+                if ($null -ne $script:progressBar -and -not $script:progressBar.IsDisposed) {
+                    if ($script:progressBar.InvokeRequired) {
+                        try {
+                            $script:progressBar.Invoke([Action]{
+                                if (-not $script:progressBar.IsDisposed) {
+                                    $currentValue = $script:progressBar.Value
+                                    if ($percent -eq 100 -or 
+                                        $percent -gt $currentValue -or 
+                                        ($percent -ge ($currentValue - 3) -and $percent -ge 0)) {
+                                        $script:progressBar.Value = $percent
+                                        $script:progressBar.Refresh()
+                                    }
+                                }
+                            })
+                        }
+                        catch {
+                            Write-RepairLog -Message "Invoke failed in progress line update: $($_.Exception.Message)" -Category "ERROR"
+                        }
+                    }
+                    else {
+                        $currentValue = $script:progressBar.Value
+                        if ($percent -eq 100 -or 
+                            $percent -gt $currentValue -or 
+                            ($percent -ge ($currentValue - 3) -and $percent -ge 0)) {
+                            $script:progressBar.Value = $percent
+                            $script:progressBar.Refresh()
+                        }
+                    }
+                }
             }
         }
-        
         # Log significant progress with throttling
         if ($null -ne $percentMatch) {
             $percent = [int]$percentMatch
@@ -3520,119 +3161,20 @@ function Update-ProgressLine {
         Write-RepairLog -Message "Error updating progress line: $($_.Exception.Message)" -Category "ERROR"
     }
 }
-
-function Update-ProgressBarSafe {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]
-        [ValidateRange(0, 100)]
-        [int]$Percent
-    )
-    
-    try {
-        if ($null -eq $script:progressBar -or $script:progressBar.IsDisposed) {
-            return
-        }
-        
-        # Use proper UI thread marshaling
-        if ($script:progressBar.InvokeRequired) {
-            # Use Invoke (synchronous) instead of BeginInvoke for critical UI updates
-            try {
-                $script:progressBar.Invoke([Action]{
-                    param()
-                    try {
-                        if (-not $script:progressBar.IsDisposed) {
-                            $currentValue = $script:progressBar.Value
-                            
-                            # Better progress logic
-                            # Allow forward progress, 100% completion, or small corrections
-                            if ($Percent -eq 100 -or 
-                                $Percent -gt $currentValue -or 
-                                ($Percent -ge ($currentValue - 3) -and $Percent -ge 0)) {
-                                
-                                $script:progressBar.Value = $Percent
-                                
-                                # Force immediate visual update
-                                try {
-                                    $script:progressBar.Refresh()
-                                }
-                                catch {
-                                    # Silently continue if refresh fails
-                                }
-                                
-                                Write-RepairLog -Message "Progress bar updated to $Percent%" -Category "DEBUG"
-                            }
-                        }
-                    }
-                    catch {
-                        Write-RepairLog -Message "Error in progress bar update delegate: $($_.Exception.Message)" -Category "ERROR"
-                    }
-                })
-            }
-            catch {
-                Write-RepairLog -Message "Failed to invoke progress bar update: $($_.Exception.Message)" -Category "ERROR"
-                
-                # Fallback - try direct update if we're close to UI thread
-                try {
-                    if (-not $script:progressBar.IsDisposed) {
-                        $script:progressBar.Value = $Percent
-                    }
-                }
-                catch {
-                    Write-RepairLog -Message "Direct progress bar update also failed: $($_.Exception.Message)" -Category "ERROR"
-                }
-            }
-        }
-        else {
-            # We're already on the UI thread
-            try {
-                $currentValue = $script:progressBar.Value
-                
-                if ($Percent -eq 100 -or 
-                    $Percent -gt $currentValue -or 
-                    ($Percent -ge ($currentValue - 3) -and $Percent -ge 0)) {
-                    
-                    $script:progressBar.Value = $Percent
-                    $script:progressBar.Refresh()
-                    Write-RepairLog -Message "Progress bar updated to $Percent% (direct)" -Category "DEBUG"
-                }
-            }
-            catch {
-                Write-RepairLog -Message "Direct progress bar update failed: $($_.Exception.Message)" -Category "ERROR"
-            }
-        }
-    }
-    catch {
-        Write-RepairLog -Message "Error in Update-ProgressBarSafe: $($_.Exception.Message)" -Category "ERROR"
-    }
-}
-
 function Show-WindowsOldPrompt {
     try {
         Write-RepairLog -Message "=== WINDOWS.OLD PROMPT STARTING ===" -Category "USER"
-        
         if ($null -eq $script:form -or $script:form.IsDisposed) {
             Write-RepairLog -Message "ERROR: Form is disposed" -Category "ERROR"
             return
         }
-        
-        # Stop timer during modal dialog
-        $timerWasRunning = $false
-        if ($null -ne $script:progressUpdateTimer -and $script:progressUpdateTimer.Enabled) {
-            $timerWasRunning = $true
-            Stop-ProgressTimer
-            Write-RepairLog -Message "Progress timer stopped for Windows.old dialog" -Category "USER"
-        }
-        
         try {
             # Create message
             $message = "The Windows.old folder contains your previous Windows installation.`n`n" +
                        "Removing it will free up disk space but will prevent you from rolling back to your previous Windows version.`n`n" +
                        "Do you want to remove the Windows.old folder?`n`n" +
                        "⚠️ This action cannot be undone!"
-            
             Write-RepairLog -Message "Displaying Windows.old removal dialog" -Category "USER"
-            
             # Show dialog with proper error handling
             $dialogResult = [System.Windows.Forms.DialogResult]::No
             try {
@@ -3655,25 +3197,20 @@ function Show-WindowsOldPrompt {
                     [System.Windows.Forms.MessageBoxIcon]::Question
                 )
             }
-            
             # Process decision
             $decision = if ($dialogResult -eq [System.Windows.Forms.DialogResult]::Yes) { "YES" } else { "NO" }
             Write-RepairLog -Message "User selected: $decision for Windows.old removal" -Category "USER"
-            
             # Communicate decision to job with improved retry logic
             $communicationSuccess = $false
             for ($attempt = 1; $attempt -le 3; $attempt++) {
                 try {
                     Set-JobCommunication -JobId $script:currentJobId -Key "WINDOWSOLD_DECISION" -Value $decision
-                    
                     # Brief verification delay
                     Start-Sleep -Milliseconds 150
-                    
-                    # Verify communication file exists
+                    # Verify communication file exists (using wildcard)
                     $userTempPath = [System.IO.Path]::GetTempPath()
-                    $expectedFile = [System.IO.Path]::Combine($userTempPath, "$($script:CONSTANTS.COMMUNICATION_PREFIX)_$($script:currentJobId)_WINDOWSOLD_DECISION.tmp")
-                    
-                    if (Test-Path $expectedFile) {
+                    $files = Get-ChildItem -Path $userTempPath -Filter "RepairToolkit_$($script:currentJobId)_WINDOWSOLD_DECISION_*.tmp" -ErrorAction SilentlyContinue
+                    if ($files) {
                         $communicationSuccess = $true
                         break
                     }
@@ -3681,70 +3218,36 @@ function Show-WindowsOldPrompt {
                 catch {
                     Write-RepairLog -Message "Communication attempt $attempt failed: $($_.Exception.Message)" -Category "ERROR"
                 }
-                
                 if ($attempt -lt 3) {
                     Start-Sleep -Milliseconds 200
                 }
             }
-            
             if (-not $communicationSuccess) {
                 Write-RepairLog -Message "WARNING: All communication attempts failed" -Category "ERROR"
             }
-            
             Write-RepairLog -Message "=== WINDOWS.OLD PROMPT COMPLETED ===" -Category "USER"
         }
         finally {
-            # Restart timer if it was running
-            if ($timerWasRunning) {
-                try {
-                    Start-ProgressTimer
-                    Write-RepairLog -Message "Progress timer resumed" -Category "USER"
-                }
-                catch {
-                    Write-RepairLog -Message "Error resuming timer: $($_.Exception.Message)" -Category "WARNING"
-                }
-            }
+            # Timer is stopped before this function is called, so no need to restart here
         }
     }
     catch {
         Write-RepairLog -Message "Critical error in Windows.old prompt: $($_.Exception.Message)" -Category "ERROR"
-        # Ensure timer is restarted even on error
-        try {
-            if ($null -eq $script:progressUpdateTimer -or -not $script:progressUpdateTimer.Enabled) {
-                Start-ProgressTimer
-            }
-        }
-        catch {
-            # Final fallback
-        }
     }
 }
-
 function Show-ExplorerRestartPrompt {
     try {
         Write-RepairLog -Message "=== EXPLORER RESTART PROMPT STARTING ===" -Category "USER"
-        
         if ($null -eq $script:form -or $script:form.IsDisposed) {
             Write-RepairLog -Message "ERROR: Form is disposed" -Category "ERROR"
             return
         }
-        
-        # Stop timer during modal dialog
-        $timerWasRunning = $false
-        if ($null -ne $script:progressUpdateTimer -and $script:progressUpdateTimer.Enabled) {
-            $timerWasRunning = $true
-            Stop-ProgressTimer
-            Write-RepairLog -Message "Progress timer stopped for Explorer dialog" -Category "USER"
-        }
-        
         try {
             # Create message
             $message = "To complete the icon cache refresh, Windows Explorer needs to be restarted.`n`n" +
                        "This will temporarily close all File Explorer windows and make the desktop/taskbar disappear for a few seconds.`n`n" +
                        "Do you want to proceed?"
-            
             Write-RepairLog -Message "Displaying Explorer restart dialog" -Category "USER"
-            
             # Show dialog with proper error handling
             $dialogResult = [System.Windows.Forms.DialogResult]::No
             try {
@@ -3767,25 +3270,20 @@ function Show-ExplorerRestartPrompt {
                     [System.Windows.Forms.MessageBoxIcon]::Question
                 )
             }
-            
             # Process decision
             $decision = if ($dialogResult -eq [System.Windows.Forms.DialogResult]::Yes) { "YES" } else { "NO" }
             Write-RepairLog -Message "User selected: $decision for Explorer restart" -Category "USER"
-            
             # Communicate decision to job with improved retry logic
             $communicationSuccess = $false
             for ($attempt = 1; $attempt -le 3; $attempt++) {
                 try {
                     Set-JobCommunication -JobId $script:currentJobId -Key "EXPLORER_RESTART" -Value $decision
-                    
                     # Brief verification delay
                     Start-Sleep -Milliseconds 150
-                    
-                    # Verify communication file exists
+                    # Verify communication file exists (using wildcard)
                     $userTempPath = [System.IO.Path]::GetTempPath()
-                    $expectedFile = [System.IO.Path]::Combine($userTempPath, "$($script:CONSTANTS.COMMUNICATION_PREFIX)_$($script:currentJobId)_EXPLORER_RESTART.tmp")
-                    
-                    if (Test-Path $expectedFile) {
+                    $files = Get-ChildItem -Path $userTempPath -Filter "RepairToolkit_$($script:currentJobId)_EXPLORER_RESTART_*.tmp" -ErrorAction SilentlyContinue
+                    if ($files) {
                         $communicationSuccess = $true
                         Write-RepairLog -Message "Explorer restart communication verified" -Category "USER"
                         break
@@ -3794,45 +3292,23 @@ function Show-ExplorerRestartPrompt {
                 catch {
                     Write-RepairLog -Message "Explorer communication attempt $attempt failed: $($_.Exception.Message)" -Category "ERROR"
                 }
-                
                 if ($attempt -lt 3) {
                     Start-Sleep -Milliseconds 200
                 }
             }
-            
             if (-not $communicationSuccess) {
                 Write-RepairLog -Message "WARNING: Explorer restart communication failed" -Category "ERROR"
             }
-            
             Write-RepairLog -Message "=== EXPLORER RESTART PROMPT COMPLETED ===" -Category "USER"
         }
         finally {
-            # Resume timer if it was running
-            if ($timerWasRunning) {
-                try {
-                    Start-ProgressTimer
-                    Write-RepairLog -Message "Progress timer resumed" -Category "USER"
-                }
-                catch {
-                    Write-RepairLog -Message "Error resuming timer: $($_.Exception.Message)" -Category "WARNING"
-                }
-            }
+            # Timer is stopped before this function is called, so no need to restart here
         }
     }
     catch {
         Write-RepairLog -Message "Critical error in Explorer restart prompt: $($_.Exception.Message)" -Category "ERROR"
-        # Ensure timer is restarted even on error
-        try {
-            if ($null -eq $script:progressUpdateTimer -or -not $script:progressUpdateTimer.Enabled) {
-                Start-ProgressTimer
-            }
-        }
-        catch {
-            # Final fallback
-        }
     }
 }
-
 function Get-JobDisplayName {
     [CmdletBinding()]
     param(
@@ -3840,13 +3316,10 @@ function Get-JobDisplayName {
         [AllowEmptyString()]
         [string]$JobName
     )
-    
     if ([string]::IsNullOrWhiteSpace($JobName)) {
         return "Operation"
     }
-    
     $lowerJobName = $JobName.ToLower()
-    
     if ($lowerJobName -like "*dism*") {
         return "DISM Repair"
     }
@@ -3860,7 +3333,6 @@ function Get-JobDisplayName {
         return "Operation"
     }
 }
-
 function Update-StatusDisplay {
     try {
         # Validate state
@@ -3870,17 +3342,14 @@ function Update-StatusDisplay {
             $null -eq $script:progressBar -or $script:progressBar.IsDisposed) {
             return
         }
-        
         # Throttle UI updates
         $currentTime = Get-Date
         if ($script:lastUiUpdate -eq [DateTime]::MinValue -or 
             ($currentTime - $script:lastUiUpdate).TotalMilliseconds -ge $script:CONSTANTS.UI_UPDATE_THROTTLE_MS) {
-            
             $jobDisplayName = Get-JobDisplayName -JobName $script:currentRepairJob.Name
             $currentProgress = $script:progressBar.Value
             $newStatusText = "$jobDisplayName in progress... $currentProgress%"
-            
-            # Thread-safe status update using Invoke instead of BeginInvoke for immediate update
+            # Use synchronous Invoke
             if ($script:statusLabel.Text -ne $newStatusText) {
                 try {
                     if ($script:statusLabel.InvokeRequired) {
@@ -3898,7 +3367,6 @@ function Update-StatusDisplay {
                     # Silently continue if UI update fails
                 }
             }
-            
             $script:lastUiUpdate = $currentTime
         }
     }
@@ -3910,12 +3378,9 @@ function Update-StatusDisplay {
         Write-RepairLog -Message "Error updating status display: $($_.Exception.Message)" -Category "WARNING"
     }
 }
-
 function Get-JobOperation {
     if ($null -eq $script:currentRepairJob) { return "TOOLKIT" }
-    
     $jobNameLower = $script:currentRepairJob.Name.ToLower()
-    
     if ($jobNameLower -like "*dism*") {
         return "DISM"
     }
@@ -3929,7 +3394,6 @@ function Get-JobOperation {
         return "TOOLKIT"
     }
 }
-
 function Reset-JobState {
     $script:currentJobId = [String]::Empty
     $script:capturedJobResult = $null
@@ -3947,7 +3411,6 @@ function Reset-JobState {
     $script:lastProcessedOutputCount = 0
 }
 #endregion
-
 #region 11. Job Result Processing and Completion Handlers
 function Get-JobResult {
     [CmdletBinding()]
@@ -3956,13 +3419,10 @@ function Get-JobResult {
         [ValidateNotNull()]
         [System.Management.Automation.Job]$Job
     )
-    
     try {
         Write-RepairLog -Message "Retrieving results for job: $($Job.Name)" -Category "JOB"
-        
         # Give job time to finish writing output
         Start-Sleep -Milliseconds 200
-        
         # Receive all job output with error handling
         $allOutput = @()
         try {
@@ -3971,7 +3431,6 @@ function Get-JobResult {
         }
         catch {
             Write-RepairLog -Message "Error receiving final job output: $($_.Exception.Message)" -Category "ERROR"
-            
             # Try to get whatever output we can
             try {
                 $allOutput = @(Receive-Job -Job $Job -Keep -ErrorAction SilentlyContinue)
@@ -3981,7 +3440,6 @@ function Get-JobResult {
                 $allOutput = @()
             }
         }
-        
         # Check for empty output
         if ($null -eq $allOutput -or $allOutput.Count -eq 0) {
             Write-RepairLog -Message "Job produced no output" -Category "WARNING"
@@ -3992,22 +3450,18 @@ function Get-JobResult {
                 OutputLines   = 0
             }
         }
-        
         Write-RepairLog -Message "Job produced $($allOutput.Count) output items" -Category "JOB"
-        
         # Try to find result objects with different markers
         $finalResult = Get-ResultBetweenMarkers -Output $allOutput -StartMarker "FINAL_RESULT_START" -EndMarker "FINAL_RESULT_END"
         if ($null -ne $finalResult) {
             Write-RepairLog -Message "Found cleanup job result" -Category "JOB"
             return $finalResult
         }
-        
         $commandResult = Get-ResultBetweenMarkers -Output $allOutput -StartMarker "COMMAND_RESULT_START" -EndMarker "COMMAND_RESULT_END"
         if ($null -ne $commandResult) {
             Write-RepairLog -Message "Found command job result" -Category "JOB"
             return $commandResult
         }
-        
         # Look for any PSCustomObject with ExitCode property
         foreach ($item in $allOutput) {
             if ($null -ne $item -and $item -is [PSCustomObject] -and 
@@ -4015,7 +3469,6 @@ function Get-JobResult {
                 return $item
             }
         }
-        
         # Create fallback result based on job state
         $exitCode = switch ($Job.State) {
             'Completed' { 0 }
@@ -4023,7 +3476,6 @@ function Get-JobResult {
             'Stopped' { -1 }
             default { 1 }
         }
-        
         Write-RepairLog -Message "No result object found, creating fallback (Job State: $($Job.State))" -Category "WARNING"
         return [PSCustomObject]@{ 
             ExitCode      = $exitCode
@@ -4043,27 +3495,22 @@ function Get-JobResult {
         }
     }
 }
-
 function Get-ResultBetweenMarkers {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [ValidateNotNull()]
         [array]$Output,
-        
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$StartMarker,
-        
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$EndMarker
     )
-    
     try {
         $startIndex = -1
         $endIndex = -1
-        
         # Find markers
         for ($i = 0; $i -lt $Output.Count; $i++) {
             $item = $Output[$i]
@@ -4078,7 +3525,6 @@ function Get-ResultBetweenMarkers {
                 }
             }
         }
-        
         # Extract result if found
         if ($startIndex -ne -1 -and $endIndex -gt $startIndex) {
             $resultIndex = $startIndex + 1
@@ -4089,7 +3535,6 @@ function Get-ResultBetweenMarkers {
                 }
             }
         }
-        
         return $null
     }
     catch {
@@ -4109,16 +3554,20 @@ function Complete-DismJob {
     try {
         $duration = if ($script:operationStartTime -ne [DateTime]::MinValue) { 
             (Get-Date) - $script:operationStartTime 
-        }
-        else { 
-            New-TimeSpan 
-        }
-        
+        } else { New-TimeSpan }
+
         $success = ($null -ne $JobResult -and $JobResult.ExitCode -eq 0)
-        
-        # Log completion
+
         Write-OperationEnd -OperationType "DISM" -Duration $duration -Success $success -ExitCode $JobResult.ExitCode
-        
+
+        # --- CRITICAL FIX STARTS HERE ---
+        # Do not attempt any UI interaction if the form is gone or shutting down.
+        if ($null -eq $script:form -or $script:form.IsDisposed -or $script:form.Disposing) {
+            Write-RepairLog -Message "Form is disposed. Skipping final DISM UI messages." -Category "WARNING" -Operation "DISM"
+            return
+        }
+        # --- CRITICAL FIX ENDS HERE ---
+
         if ($success) {
             Update-UiForJobEnd -StatusMessage "SUCCESS: STEP 1 completed successfully." -IsSuccess $true
             $message = "DISM successfully repaired the Windows system image.`n`n" +
@@ -4154,16 +3603,20 @@ function Complete-SfcJob {
         else { 
             New-TimeSpan 
         }
-        
         $success = ($null -ne $JobResult -and $JobResult.ExitCode -eq 0)
         
-        # Prepare additional info
+        # --- CRITICAL FIX STARTS HERE ---
+        if ($null -eq $script:form -or $script:form.IsDisposed -or $script:form.Disposing) {
+            Write-RepairLog -Message "Form is disposed. Skipping final SFC UI messages." -Category "WARNING" -Operation "SFC"
+            return
+        }
+        # --- CRITICAL FIX ENDS HERE ---
+
         $additionalInfo = ""
         if ($JobResult.OutputLines -gt 0) {
             $additionalInfo = "$($JobResult.OutputLines) output lines processed."
         }
         
-        # Log completion
         Write-OperationEnd -OperationType "SFC" -Duration $duration -Success $success -ExitCode $JobResult.ExitCode -AdditionalInfo $additionalInfo
         
         if ($success) {
@@ -4201,60 +3654,33 @@ function Complete-DiskCleanupJob {
         else { 
             New-TimeSpan 
         }
-        
         $success = ($null -ne $JobResult -and $JobResult.ExitCode -eq 0)
+
+        # --- CRITICAL FIX STARTS HERE ---
+        if ($null -eq $script:form -or $script:form.IsDisposed -or $script:form.Disposing) {
+            Write-RepairLog -Message "Form is disposed. Skipping final Cleanup UI messages." -Category "WARNING" -Operation "CLEANUP"
+            return
+        }
+        # --- CRITICAL FIX ENDS HERE ---
         
-        # Build additional info
         $additionalInfo = @()
         if ($JobResult.WindowsOldExists) { 
-            if ($JobResult.WindowsOldRemoved) {
-                if ($JobResult.WindowsOldActuallyRemoved) {
-                    $additionalInfo += "Windows.old folder was successfully removed."
-                }
-                else {
-                    $additionalInfo += "Windows.old removal was attempted but may not have completed."
-                }
-            }
-            else {
-                $additionalInfo += "Windows.old folder was preserved."
-            }
+            $additionalInfo += if ($JobResult.WindowsOldActuallyRemoved) { "Windows.old folder was successfully removed." } else { "Windows.old folder was preserved or removal failed." }
         }
-        
         if ($JobResult.TotalSpaceFreedMB -gt 0) {
             $additionalInfo += "$($JobResult.TotalSpaceFreedMB) MB freed."
         }
         
-        $additionalInfoText = $additionalInfo -join " "
-        
-        # Log completion
-        Write-OperationEnd -OperationType "CLEANUP" -Duration $duration -Success $success -ExitCode $JobResult.ExitCode -AdditionalInfo $additionalInfoText
+        Write-OperationEnd -OperationType "CLEANUP" -Duration $duration -Success $success -ExitCode $JobResult.ExitCode -AdditionalInfo ($additionalInfo -join " ")
         
         if ($success) {
             Update-UiForJobEnd -StatusMessage "SUCCESS: STEP 3 completed successfully." -IsSuccess $true
-            
-            # Build success message
-            $message = "Disk cleanup and optimization finished successfully!`n`n"
-            $message += "Completed operations:`n"
-            $message += "• Temporary file removal`n"
-            $message += "• Registry cleanup configuration`n"
-            $message += "• Cache optimization`n"
-            $message += "• Network optimization"
-            
-            if ($JobResult.WindowsOldActuallyRemoved) {
-                $message += "`n• Windows.old folder removal"
-            }
-            
-            if ($JobResult.TotalSpaceFreedMB -gt 0) {
-                $message += "`n`nTotal space freed: $($JobResult.TotalSpaceFreedMB) MB"
-            }
-            
+            $message = "Disk cleanup and optimization finished successfully!`n`nTotal space freed: $($JobResult.TotalSpaceFreedMB) MB"
             Show-InfoMessage -Title "Cleanup Complete" -Message $message
         }
         else {
             Update-UiForJobEnd -StatusMessage "ERROR: Cleanup encountered issues." -IsSuccess $false
-            $message = "The cleanup process encountered issues.`n`n" +
-                       "Error: $($JobResult.StandardError)`n`n" +
-                       "Check 'SystemRepairLog.txt' on your Desktop for details."
+            $message = "The cleanup process encountered issues.`n`nError: $($JobResult.StandardError)`n`nCheck 'SystemRepairLog.txt' for details."
             Show-ErrorMessage -Title "Cleanup Issues" -Message $message
         }
     }
@@ -4270,19 +3696,15 @@ function Complete-RepairJob {
         [Parameter(Mandatory = $true)]
         [ValidateNotNull()]
         [System.Management.Automation.Job]$Job,
-        
         [Parameter(Mandatory = $true)]
         [ValidateNotNull()]
         [PSCustomObject]$JobResult
     )
-    
     try {
         $displayName = Get-JobDisplayName -JobName $Job.Name
         Write-RepairLog -Message "Processing completion for $displayName" -Category "JOB"
-        
         # Route to appropriate completion handler
         $jobNameLower = $Job.Name.ToLower()
-        
         if ($jobNameLower -like "*dism*") {
             Complete-DismJob -JobResult $JobResult
         }
@@ -4296,7 +3718,6 @@ function Complete-RepairJob {
             Write-RepairLog -Message "Unknown job type completed: '$displayName'" -Category "WARNING"
             Update-UiForJobEnd -StatusMessage "Operation completed." -IsSuccess $false
         }
-        
         # Clear job ID for cleanup jobs
         if ($jobNameLower -match "(diskcleanup|cleanup)") {
             $script:currentJobId = [String]::Empty
@@ -4309,17 +3730,13 @@ function Complete-RepairJob {
     }
 }
 #endregion
-
 #region 12. Windows 11 GUI Design - User Interface Creation Functions
 function Initialize-MainForm {
     [CmdletBinding()]
     param()
-    
     try {
         Write-RepairLog -Message "Initializing main form with Windows 11 Fluent Design" -Category "SYSTEM"
-        
         $colors = $script:FLUENT_DESIGN.Colors
-        
         # Create main form with Windows 11 styling
         $script:form = New-Object System.Windows.Forms.Form
         $script:form.Text = "System Repair Toolkit"
@@ -4331,19 +3748,14 @@ function Initialize-MainForm {
         $script:form.BackColor = $colors.BACKGROUND  # Windows 11 background color
         $script:form.Icon = [System.Drawing.SystemIcons]::Shield
         $script:form.ShowInTaskbar = $true
-        
         # Initialize fonts with Windows 11 typography
         Initialize-Fonts
-        
         # Create all controls with Fluent Design
         Initialize-Controls
-        
         # Set tab order
         Set-TabOrder
-        
         # Configure keyboard shortcuts
         Set-KeyboardShortcuts
-        
         Write-RepairLog -Message "Windows 11 Fluent Design form initialized successfully" -Category "SYSTEM"
         return $true
     }
@@ -4352,11 +3764,9 @@ function Initialize-MainForm {
         return $false
     }
 }
-
 function Initialize-Fonts {
     [CmdletBinding()]
     param()
-    
     try {
         # Use standard Windows 11 fonts with proper fallback chain
         try {
@@ -4369,26 +3779,21 @@ function Initialize-Fonts {
             $script:titleFont = New-Object System.Drawing.Font([System.Drawing.SystemFonts]::DefaultFont.FontFamily, 18, [System.Drawing.FontStyle]::Regular)
             $script:secondaryFont = New-Object System.Drawing.Font([System.Drawing.SystemFonts]::DefaultFont.FontFamily, 9, [System.Drawing.FontStyle]::Regular)
         }
-        
         Write-RepairLog -Message "Fonts initialized: $($script:titleFont.Name)" -Category "SYSTEM"
     }
     catch {
         Write-RepairLog -Message "Error initializing fonts: $($_.Exception.Message)" -Category "WARNING"
     }
 }
-
 function Initialize-Controls {
     [CmdletBinding()]
     param()
-    
     # Calculate layout using 8px grid system - Optimized spacing
     $spacing = $script:FLUENT_DESIGN.Spacing
     $colors = $script:FLUENT_DESIGN.Colors
     $buttonDims = $script:FLUENT_DESIGN.ButtonDimensions
-    
     $buttonLeftMargin = ($script:form.ClientSize.Width - $buttonDims.MAIN_WIDTH) / 2
     $currentY = $spacing.MEDIUM  # Reduced from LARGE (24px) to MEDIUM (16px)
-    
     # Create title label with clean Windows 11 typography (NO SHADOW)
     $script:titleLabel = New-Object System.Windows.Forms.Label
     $script:titleLabel.Location = New-Object System.Drawing.Point($buttonLeftMargin, $currentY)
@@ -4402,21 +3807,19 @@ function Initialize-Controls {
     $script:titleLabel.FlatStyle = 'Standard'
     $script:titleLabel.UseCompatibleTextRendering = $false
     $currentY += $script:titleLabel.Height + $spacing.TINY  # Reduced gap from SMALL (8px) to TINY (4px)
-    
     # Create instruction label with COMPLETE text and perfect alignment
     $script:instructionLabel = New-Object System.Windows.Forms.Label
     # Keep same width as buttons but ensure text fits
     $script:instructionLabel.Location = New-Object System.Drawing.Point($buttonLeftMargin, $currentY)
     $script:instructionLabel.Size = New-Object System.Drawing.Size($buttonDims.MAIN_WIDTH, 20)  # Reduced from 24 to 20
     # Shorter text that fits within button width
-    $script:instructionLabel.Text = "Sequence: DISM → SFC → Optimize"
+    $script:instructionLabel.Text = "Sequence: DISM - SFC - Optimize"
     $script:instructionLabel.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Regular)
     $script:instructionLabel.ForeColor = $colors.TEXT_SECONDARY
     $script:instructionLabel.TextAlign = "MiddleCenter"
     $script:instructionLabel.BackColor = [System.Drawing.Color]::Transparent
     $script:instructionLabel.UseCompatibleTextRendering = $false
     $currentY += $script:instructionLabel.Height + $spacing.MEDIUM  # Reduced gap from LARGE (24px) to MEDIUM (16px)
-    
     # Create DISM button with proper Windows 11 Fluent Design
     $script:dismButton = New-Object System.Windows.Forms.Button
     $script:dismButton.Location = New-Object System.Drawing.Point($buttonLeftMargin, $currentY)
@@ -4432,7 +3835,6 @@ function Initialize-Controls {
         }
     })
     $currentY += $script:dismButton.Height + $spacing.SMALL  # Reduced gap from MEDIUM (16px) to SMALL (8px)
-    
     # Create SFC button with proper Windows 11 Fluent Design
     $script:sfcButton = New-Object System.Windows.Forms.Button
     $script:sfcButton.Location = New-Object System.Drawing.Point($buttonLeftMargin, $currentY)
@@ -4449,7 +3851,6 @@ function Initialize-Controls {
         }
     })
     $currentY += $script:sfcButton.Height + $spacing.SMALL  # Reduced gap from MEDIUM (16px) to SMALL (8px)
-    
     # Create Cleanup button with proper Windows 11 Fluent Design
     $script:cleanupButton = New-Object System.Windows.Forms.Button
     $script:cleanupButton.Location = New-Object System.Drawing.Point($buttonLeftMargin, $currentY)
@@ -4466,7 +3867,6 @@ function Initialize-Controls {
         }
     })
     $currentY += $script:cleanupButton.Height + $spacing.SMALL  # Reduced gap from MEDIUM (16px) to SMALL (8px)
-    
     # Create modern Windows 11 style progress bar
     $script:progressBar = New-Object System.Windows.Forms.ProgressBar
     $script:progressBar.Location = New-Object System.Drawing.Point($buttonLeftMargin, $currentY)
@@ -4480,7 +3880,6 @@ function Initialize-Controls {
     $script:progressBar.BackColor = [System.Drawing.Color]::FromArgb(230, 230, 230)
     $script:progressBar.Visible = $false
     $currentY += $script:progressBar.Height + $spacing.SMALL  # Reduced gap from MEDIUM (16px) to SMALL (8px)
-    
     # Create status label with proper Windows 11 typography and alignment
     $script:statusLabel = New-Object System.Windows.Forms.Label
     $script:statusLabel.Location = New-Object System.Drawing.Point($buttonLeftMargin, $currentY)
@@ -4492,10 +3891,8 @@ function Initialize-Controls {
     $script:statusLabel.UseCompatibleTextRendering = $false
     $script:statusLabel.AutoEllipsis = $true
     $currentY += $script:statusLabel.Height + $spacing.TINY  # Reduced gap from MEDIUM (16px) to TINY (4px)
-    
     # Create bottom panel with Windows 11 spacing - Proper positioning
     New-FluentBottomPanel -CurrentY $currentY
-    
     # Create enhanced tooltip with Windows 11 styling
     $script:toolTip = New-Object System.Windows.Forms.ToolTip
     $script:toolTip.InitialDelay = 500
@@ -4506,7 +3903,6 @@ function Initialize-Controls {
     $script:toolTip.SetToolTip($script:dismButton, "Repairs Windows component store and system image using DISM")
     $script:toolTip.SetToolTip($script:sfcButton, "Scans and repairs corrupted system files using SFC")
     $script:toolTip.SetToolTip($script:cleanupButton, "Performs comprehensive disk cleanup and system optimization")
-    
     # Add all controls to form
     $script:form.Controls.AddRange(@(
         $script:titleLabel, 
@@ -4519,31 +3915,26 @@ function Initialize-Controls {
         $script:bottomPanel
     ))
 }
-
 function New-FluentBottomPanel {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [int]$CurrentY
     )
-    
     # Use FLUENT_DESIGN spacing constants instead of hardcoded values
     $spacing = $script:FLUENT_DESIGN.Spacing
     $buttonDims = $script:FLUENT_DESIGN.ButtonDimensions
-    
     # Completely revised button positioning calculation
     $formWidth = $script:form.ClientSize.Width
     $buttonWidth = $buttonDims.UTIL_WIDTH  # Standardized button width
     $buttonSpacing = $spacing.MEDIUM  # Use design system spacing (16px)
     $totalButtonsWidth = (3 * $buttonWidth) + (2 * $buttonSpacing)  # 3 buttons + 2 gaps
     $startX = ($formWidth - $totalButtonsWidth) / 2  # Center the button group
-    
     # Create panel with exact positioning
     $script:bottomPanel = New-Object System.Windows.Forms.Panel
     $script:bottomPanel.Location = New-Object System.Drawing.Point(0, $CurrentY)
     $script:bottomPanel.Size = New-Object System.Drawing.Size($formWidth, 36)  # Reduced height from 40 to 36
     $script:bottomPanel.BackColor = [System.Drawing.Color]::Transparent
-    
     # Create utility buttons with precise positioning
     $script:helpButton = New-Object System.Windows.Forms.Button
     $script:helpButton.Location = New-Object System.Drawing.Point($startX, $spacing.TINY)  # Use design system spacing (4px)
@@ -4557,7 +3948,6 @@ function New-FluentBottomPanel {
             Write-RepairLog -Message "Error in Help button click: $($_.Exception.Message)" -Category "ERROR"
         }
     })
-    
     $script:viewLogButton = New-Object System.Windows.Forms.Button
     $script:viewLogButton.Location = New-Object System.Drawing.Point(($startX + $buttonWidth + $buttonSpacing), $spacing.TINY)  # Use design system spacing
     Set-FluentUtilityButtonStyle -Button $script:viewLogButton -Text "View Log"
@@ -4570,7 +3960,6 @@ function New-FluentBottomPanel {
             Write-RepairLog -Message "Error in View Log button click: $($_.Exception.Message)" -Category "ERROR"
         }
     })
-    
     $script:closeButton = New-Object System.Windows.Forms.Button
     $script:closeButton.Location = New-Object System.Drawing.Point(($startX + (2 * $buttonWidth) + (2 * $buttonSpacing)), $spacing.TINY)  # Use design system spacing
     Set-FluentUtilityButtonStyle -Button $script:closeButton -Text "Close"
@@ -4583,53 +3972,42 @@ function New-FluentBottomPanel {
             Write-RepairLog -Message "Error in Close button click: $($_.Exception.Message)" -Category "ERROR"
         }
     })
-    
     # Add buttons directly to panel with exact positioning
     $script:bottomPanel.Controls.AddRange(@($script:helpButton, $script:viewLogButton, $script:closeButton))
 }
-
 function Set-FluentButtonStyle {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [ValidateNotNull()]
         [System.Windows.Forms.Button]$Button,
-        
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$Text,
-        
         [Parameter()]
         [bool]$IsPrimary = $false
     )
-    
     $colors = $script:FLUENT_DESIGN.Colors
     $buttonDims = $script:FLUENT_DESIGN.ButtonDimensions
-    
     # Set consistent Windows 11 button properties
     $Button.Size = New-Object System.Drawing.Size($buttonDims.MAIN_WIDTH, $buttonDims.MAIN_HEIGHT)
     $Button.Text = $Text
-    
     # Windows 11 typography - consistent font
     $Button.Font = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Regular)
-    
     # Windows 11 button styling
     $Button.FlatStyle = 'Flat'
     $Button.Cursor = 'Hand'
     $Button.TextAlign = 'MiddleCenter'
     $Button.UseVisualStyleBackColor = $false
     $Button.UseCompatibleTextRendering = $false
-    
     # Tag for style tracking
     $Button.Tag = if ($IsPrimary) { "FluentPrimary" } else { "FluentSecondary" }
-    
     # Apply proper Windows 11 Fluent Design styling
     if ($IsPrimary) {
         # Primary button (accent color) - Windows 11 blue
         $Button.BackColor = $colors.PRIMARY_BLUE
         $Button.ForeColor = [System.Drawing.Color]::White
         $Button.FlatAppearance.BorderSize = 0
-        
         # Windows 11 hover effects
         $Button.Add_MouseEnter({
             if ($this.Enabled) {
@@ -4658,7 +4036,6 @@ function Set-FluentButtonStyle {
         $Button.ForeColor = $colors.TEXT_PRIMARY
         $Button.FlatAppearance.BorderSize = 1
         $Button.FlatAppearance.BorderColor = $colors.BORDER_MEDIUM
-        
         # Windows 11 subtle hover effects
         $Button.Add_MouseEnter({
             if ($this.Enabled) {
@@ -4685,7 +4062,6 @@ function Set-FluentButtonStyle {
             }
         })
     }
-    
     # Windows 11 disabled state
     $Button.Add_EnabledChanged({
         try {
@@ -4713,29 +4089,23 @@ function Set-FluentButtonStyle {
         }
     })
 }
-
 function Set-FluentUtilityButtonStyle {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [ValidateNotNull()]
         [System.Windows.Forms.Button]$Button,
-        
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$Text
     )
-    
     $colors = $script:FLUENT_DESIGN.Colors
     $buttonDims = $script:FLUENT_DESIGN.ButtonDimensions
-    
     # Windows 11 utility button sizing - consistent and properly sized
     $Button.Size = New-Object System.Drawing.Size($buttonDims.UTIL_WIDTH, $buttonDims.UTIL_HEIGHT)  # Standardized size
     $Button.Text = $Text
-    
     # Windows 11 typography for utility buttons
     $Button.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Regular)  # Slightly smaller font
-    
     # Windows 11 subtle button styling
     $Button.BackColor = $colors.CARD_BACKGROUND
     $Button.ForeColor = $colors.TEXT_PRIMARY
@@ -4745,7 +4115,6 @@ function Set-FluentUtilityButtonStyle {
     $Button.Cursor = 'Hand'
     $Button.TextAlign = 'MiddleCenter'
     $Button.UseCompatibleTextRendering = $false
-    
     # Windows 11 hover effects for utility buttons
     $Button.Add_MouseEnter({
         if ($this.Enabled) {
@@ -4772,11 +4141,9 @@ function Set-FluentUtilityButtonStyle {
         }
     })
 }
-
 function Set-TabOrder {
     [CmdletBinding()]
     param()
-    
     # Set logical tab order
     $script:dismButton.TabIndex = 0
     $script:sfcButton.TabIndex = 1
@@ -4785,18 +4152,14 @@ function Set-TabOrder {
     $script:viewLogButton.TabIndex = 4
     $script:closeButton.TabIndex = 5
 }
-
 function Set-KeyboardShortcuts {
     [CmdletBinding()]
     param()
-    
     # Enable key preview on form
     $script:form.KeyPreview = $true
-    
     # Add keyboard event handler
     $script:form.Add_KeyDown({
         param($eventSender, $e)
-        
         try {
             switch ($e.KeyCode) {
                 'F1' { 
@@ -4842,13 +4205,11 @@ function Set-KeyboardShortcuts {
         }
     })
 }
-
 function Show-HelpDialog {
     [CmdletBinding()]
     param()
-    
     $helpMsg = "System Repair Toolkit v4.0`n" +
-    "Windows 11 Compatible • PowerShell 5.0+`n`n" +
+    "Windows 11 Compatible - PowerShell 5.0+`n`n" +
     "This toolkit automates essential Windows repair and system optimization:`n`n" +
     "STEP 1 - DISM System Image Repair:`n" +
     "Fixes the Windows component store and system image.`n`n" +
@@ -4858,19 +4219,16 @@ function Show-HelpDialog {
     "Multi-phase optimization including disk cleanup, registry optimization, and performance improvements.`n`n" +
     "Administrator privileges are required. All actions are logged to 'SystemRepairLog.txt' on your Desktop.`n`n" +
     "Keyboard Shortcuts:`n" +
-    "• F1: Show this help`n" +
-    "• F2: View log file`n" +
-    "• 1-3: Run steps 1-3`n" +
-    "• ESC: Close application"
-    
+    "- F1: Show this help`n" +
+    "- F2: View log file`n" +
+    "- 1-3: Run steps 1-3`n" +
+    "- ESC: Close application"
     Show-InfoMessage -Title "System Repair Toolkit - Help" -Message $helpMsg
     Write-RepairLog -Message "User accessed help documentation" -Category "USER"
 }
-
 function Open-LogFile {
     [CmdletBinding()]
     param()
-    
     try {
         if (Test-Path $script:logPath) {
             # Try to open with notepad
@@ -4895,7 +4253,6 @@ function Open-LogFile {
     }
 }
 #endregion
-
 #region 13. UI State Management Functions - Dynamic UI Updates
 function Update-UiForJobStart {
     [CmdletBinding()]
@@ -4904,7 +4261,6 @@ function Update-UiForJobStart {
         [ValidateNotNullOrEmpty()]
         [string]$StatusMessage
     )
-    
     try {
         # Synchronous UI updates for critical initialization
         if ($null -ne $script:form -and -not $script:form.IsDisposed) {
@@ -4916,29 +4272,24 @@ function Update-UiForJobStart {
                         if ($null -eq $script:form -or $script:form.IsDisposed -or $script:form.Disposing) {
                             return
                         }
-                        
                         # Update status label
                         if ($null -ne $script:statusLabel -and -not $script:statusLabel.IsDisposed) {
                             $script:statusLabel.Text = $StatusMessage
                             $script:statusLabel.ForeColor = $script:FLUENT_DESIGN.Colors.TEXT_PRIMARY
                         }
-                        
                         # Disable all main buttons
                         @($script:dismButton, $script:sfcButton, $script:cleanupButton) | ForEach-Object {
                             if ($null -ne $_ -and -not $_.IsDisposed) {
                                 $_.Enabled = $false
                             }
                         }
-                        
                         # Reset and show progress bar with explicit visibility and refresh
                         if ($null -ne $script:progressBar -and -not $script:progressBar.IsDisposed) {
                             $script:progressBar.Value = 0
                             $script:progressBar.Visible = $true
                             $script:progressBar.Refresh()
-                            
                             Write-RepairLog -Message "Progress bar reset to 0% and made visible" -Category "DEBUG"
                         }
-                        
                         # Update form title
                         if ($null -ne $script:form -and -not $script:form.IsDisposed) {
                             $script:form.Text = "System Repair Toolkit - Operation in Progress"
@@ -4955,152 +4306,113 @@ function Update-UiForJobStart {
                     $script:statusLabel.Text = $StatusMessage
                     $script:statusLabel.ForeColor = $script:FLUENT_DESIGN.Colors.TEXT_PRIMARY
                 }
-                
                 @($script:dismButton, $script:sfcButton, $script:cleanupButton) | ForEach-Object {
                     if ($null -ne $_ -and -not $_.IsDisposed) {
                         $_.Enabled = $false
                     }
                 }
-                
                 if ($null -ne $script:progressBar -and -not $script:progressBar.IsDisposed) {
                     $script:progressBar.Value = 0
                     $script:progressBar.Visible = $true
                     $script:progressBar.Refresh()
                     Write-RepairLog -Message "Progress bar reset to 0% and made visible (direct)" -Category "DEBUG"
                 }
-                
                 if ($null -ne $script:form -and -not $script:form.IsDisposed) {
                     $script:form.Text = "System Repair Toolkit - Operation in Progress"
                 }
             }
         }
-        
         Write-RepairLog -Message "UI updated for job start: $StatusMessage" -Category "SYSTEM"
     }
     catch {
         Write-RepairLog -Message "Error updating UI for job start: $($_.Exception.Message)" -Category "ERROR"
     }
 }
-
 function Update-UiForJobEnd {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [ValidateNotNullOrEmpty()]
         [string]$StatusMessage,
-        
         [Parameter(Mandatory = $true)]
         [bool]$IsSuccess
     )
-    
     try {
-        # Synchronous UI updates for job completion
         if ($null -ne $script:form -and -not $script:form.IsDisposed) {
+            $updateAction = {
+                try {
+                    if ($null -eq $script:form -or $script:form.IsDisposed -or $script:form.Disposing) {
+                        return
+                    }
+                    if ($null -ne $script:progressBar -and -not $script:progressBar.IsDisposed) {
+                        if ($IsSuccess) {
+                            $script:progressBar.Value = 100
+                            $script:progressBar.Refresh()
+                            $script:uiDelayTimer = New-Object System.Windows.Forms.Timer
+                            $script:uiDelayTimer.Interval = 750
+                            $script:uiDelayTimer.Add_Tick({
+                                if ($null -eq $script:progressBar -or $script:progressBar.IsDisposed -or $script:progressBar.FindForm().IsDisposed) {
+                                    $script:uiDelayTimer.Stop()
+                                    $script:uiDelayTimer.Dispose()
+                                    $script:uiDelayTimer = $null
+                                    return
+                                }
+                                $script:progressBar.Visible = $false
+                                $script:uiDelayTimer.Stop()
+                                $script:uiDelayTimer.Dispose()
+                                $script:uiDelayTimer = $null
+                            })
+                            $script:uiDelayTimer.Start()
+                        }
+                        else {
+                            $script:progressBar.Visible = $false
+                        }
+                    }
+                    if ($null -ne $script:statusLabel -and -not $script:statusLabel.IsDisposed) {
+                        $script:statusLabel.Text = $StatusMessage
+                        $script:statusLabel.ForeColor = if ($IsSuccess) { $script:FLUENT_DESIGN.Colors.SUCCESS_GREEN } else { $script:FLUENT_DESIGN.Colors.ERROR_RED }
+                    }
+                    @($script:dismButton, $script:sfcButton, $script:cleanupButton) | ForEach-Object {
+                        if ($null -ne $_ -and -not $_.IsDisposed) {
+                            $_.Enabled = $true
+                        }
+                    }
+                    if ($null -ne $script:form -and -not $script:form.IsDisposed) {
+                        $script:form.Text = "System Repair Toolkit"
+                    }
+                }
+                catch {
+                    Write-RepairLog -Message "Error in job end UI update delegate: $($_.Exception.Message)" -Category "ERROR"
+                }
+            }
             if ($script:form.InvokeRequired) {
-                $script:form.Invoke([Action]{
-                    try {
-                        # Check if form is still valid
-                        if ($null -eq $script:form -or $script:form.IsDisposed -or $script:form.Disposing) {
-                            return
-                        }
-                        
-                        # Set progress bar to 100% if successful before hiding
-                        if ($null -ne $script:progressBar -and -not $script:progressBar.IsDisposed) {
-                            if ($IsSuccess) {
-                                $script:progressBar.Value = 100
-                                $script:progressBar.Refresh()
-                                
-                                # Show 100% for a moment before hiding
-                                Start-Sleep -Milliseconds 500
-                            }
-                            $script:progressBar.Visible = $true  # Keep visible to show final state
-                        }
-                        
-                        # Update status label with appropriate color
-                        if ($null -ne $script:statusLabel -and -not $script:statusLabel.IsDisposed) {
-                            $script:statusLabel.Text = $StatusMessage
-                            if ($IsSuccess) {
-                                $script:statusLabel.ForeColor = $script:FLUENT_DESIGN.Colors.SUCCESS_GREEN
-                            }
-                            else {
-                                $script:statusLabel.ForeColor = $script:FLUENT_DESIGN.Colors.ERROR_RED
-                            }
-                        }
-                        
-                        # Re-enable all main buttons
-                        $buttonsToEnable = @($script:dismButton, $script:sfcButton, $script:cleanupButton)
-                        foreach ($button in $buttonsToEnable) {
-                            if ($null -ne $button -and -not $button.IsDisposed) { 
-                                $button.Enabled = $true 
-                            }
-                        }
-                        
-                        # Reset form title
-                        if ($null -ne $script:form -and -not $script:form.IsDisposed) {
-                            $script:form.Text = "System Repair Toolkit"
-                        }
-                    }
-                    catch {
-                        Write-RepairLog -Message "Error in job end UI update delegate: $($_.Exception.Message)" -Category "ERROR"
-                    }
-                })
+                $script:form.Invoke($updateAction)
             }
             else {
-                # Already on UI thread
-                if ($null -ne $script:progressBar -and -not $script:progressBar.IsDisposed) {
-                    if ($IsSuccess) {
-                        $script:progressBar.Value = 100
-                        $script:progressBar.Refresh()
-                        Start-Sleep -Milliseconds 500
-                    }
-                    $script:progressBar.Visible = $true
-                }
-                
-                if ($null -ne $script:statusLabel -and -not $script:statusLabel.IsDisposed) {
-                    $script:statusLabel.Text = $StatusMessage
-                    if ($IsSuccess) {
-                        $script:statusLabel.ForeColor = $script:FLUENT_DESIGN.Colors.SUCCESS_GREEN
-                    }
-                    else {
-                        $script:statusLabel.ForeColor = $script:FLUENT_DESIGN.Colors.ERROR_RED
-                    }
-                }
-                
-                @($script:dismButton, $script:sfcButton, $script:cleanupButton) | ForEach-Object {
-                    if ($null -ne $_ -and -not $_.IsDisposed) {
-                        $_.Enabled = $true
-                    }
-                }
-                
-                if ($null -ne $script:form -and -not $script:form.IsDisposed) {
-                    $script:form.Text = "System Repair Toolkit"
-                }
+                & $updateAction
             }
         }
-        
         Write-RepairLog -Message "UI updated for job end: $StatusMessage (Success: $IsSuccess)" -Category "SYSTEM"
     }
     catch {
         Write-RepairLog -Message "Error updating UI for job end: $($_.Exception.Message)" -Category "ERROR"
     }
 }
-
 function Set-ReadyStatus {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]
         [bool]$IsAdministrator
     )
-    
     try {
         if ($null -ne $script:statusLabel -and -not $script:statusLabel.IsDisposed) {
             if ($IsAdministrator) {
-                $script:statusLabel.Text = "Ready • Admin Mode • All functions available"
+                $script:statusLabel.Text = "Ready - Admin Mode - All functions available"
                 $script:statusLabel.ForeColor = $script:FLUENT_DESIGN.Colors.SUCCESS_GREEN
                 Write-RepairLog -Message "UI status set: Administrator mode" -Category "SYSTEM"
             }
             else {
-                $script:statusLabel.Text = "Limited Mode • Run as Administrator for full functionality"
+                $script:statusLabel.Text = "Limited Mode - Run as Administrator for full functionality"
                 $script:statusLabel.ForeColor = $script:FLUENT_DESIGN.Colors.WARNING_ORANGE
                 Write-RepairLog -Message "UI status set: Limited mode" -Category "WARNING"
             }
@@ -5112,29 +4424,23 @@ function Set-ReadyStatus {
     }
 }
 #endregion
-
 #region 14. Form Event Handlers - Application Lifecycle Event Definitions
 # Form closing event handler
 $script:form_FormClosing = {
     param($formSender, $closeEventArgs)
-    
     try {
         Write-RepairLog -Message "Application shutdown initiated" -Category "SYSTEM"
-        
         # Stop progress timer
         Stop-ProgressTimer
-        
         # Check if job is running
         if ($null -ne $script:currentRepairJob) {
             try {
                 $jobState = $script:currentRepairJob.State
                 Write-RepairLog -Message "Current job state: $jobState" -Category "JOB"
-                
                 if ($jobState -eq 'Running') {
                     # Ask user for confirmation
                     $message = "A repair operation is in progress. Are you sure you want to exit?"
                     $result = Show-QuestionMessage -Message $message -Title "Operation in Progress"
-                    
                     if ($result -eq [System.Windows.Forms.DialogResult]::No) {
                         $closeEventArgs.Cancel = $true
                         Write-RepairLog -Message "Shutdown cancelled by user" -Category "USER"
@@ -5143,7 +4449,6 @@ $script:form_FormClosing = {
                         return
                     }
                 }
-                
                 # Stop the job
                 Write-RepairLog -Message "Stopping active repair job" -Category "JOB"
                 try {
@@ -5158,10 +4463,8 @@ $script:form_FormClosing = {
                 Write-RepairLog -Message "Error checking job state: $($_.Exception.Message)" -Category "WARNING"
             }
         }
-        
         # Clear current job reference
         $script:currentRepairJob = $null
-        
         # Clean up communication files
         if (-not [string]::IsNullOrEmpty($script:currentJobId)) {
             try {
@@ -5171,7 +4474,6 @@ $script:form_FormClosing = {
                 Write-RepairLog -Message "Error clearing communication files: $($_.Exception.Message)" -Category "WARNING"
             }
         }
-        
         # Dispose of resources
         try {
             # Dispose tooltip
@@ -5179,7 +4481,6 @@ $script:form_FormClosing = {
                 $script:toolTip.Dispose()
                 $script:disposedObjects.Add($script:toolTip) | Out-Null
             }
-            
             # Dispose fonts
             if ($null -ne $script:titleFont -and -not $script:disposedObjects.Contains($script:titleFont)) {
                 $script:titleFont.Dispose()
@@ -5193,40 +4494,33 @@ $script:form_FormClosing = {
         catch {
             Write-RepairLog -Message "Error disposing resources: $($_.Exception.Message)" -Category "WARNING"
         }
-        
         Write-RepairLog -Message "Application shutdown completed" -Category "SYSTEM"
     }
     catch {
         Write-Warning "Error during shutdown: $($_.Exception.Message)"
     }
 }
-
 # Form load event handler
 $script:form_Load = {
     try {
         Write-RepairLog -Message "Main window loaded" -Category "SYSTEM"
-        
         # Check administrator status
         $isAdmin = Test-IsAdministrator
         Set-ReadyStatus -IsAdministrator $isAdmin
-        
         # Log system information
         $osInfo = [System.Environment]::OSVersion
-        # FIXED: Use $Host.Version instead of $PSVersionTable
+        # Use $Host.Version instead of $PSVersionTable
         $psVersion = $Host.Version.ToString()
         Write-RepairLog -Message "System Info - OS: $($osInfo.VersionString), PS: $psVersion" -Category "SYSTEM"
-        
         # Set initial focus
         if ($null -ne $script:dismButton -and -not $script:dismButton.IsDisposed) {
             $script:dismButton.Focus()
         }
-        
         # Show limited mode warning if not admin
         if (-not $isAdmin) {
             $message = "Welcome!`n`nYou are in Limited Mode. For full functionality, please restart as Administrator."
             Show-InfoMessage -Title "Limited Mode Notice" -Message $message
         }
-        
         $script:isInitialized = $true
     }
     catch {
@@ -5234,12 +4528,10 @@ $script:form_Load = {
         $script:isInitialized = $false
     }
 }
-
 # Form shown event handler
 $script:form_Shown = {
     try {
         Write-RepairLog -Message "Application interface displayed" -Category "SYSTEM"
-        
         # Log startup mode
         if (Test-IsAdministrator) {
             Write-RepairLog -Message "Toolkit started with Administrator privileges" -Category "SYSTEM"
@@ -5247,29 +4539,24 @@ $script:form_Shown = {
         else {
             Write-RepairLog -Message "Toolkit started in standard user mode" -Category "WARNING"
         }
-        
         # Verify log file accessibility
         if (-not (Test-Path $script:logPath)) {
             Write-RepairLog -Message "Warning: Log file path may not be accessible" -Category "WARNING"
         }
-        
         Write-RepairLog -Message "Initialization completed successfully" -Category "SYSTEM"
     }
     catch {
         Write-RepairLog -Message "Error during form shown event: $($_.Exception.Message)" -Category "ERROR"
     }
 }
-
 function Register-FormEvents {
     [CmdletBinding()]
     param()
-    
     try {
         # Register event handlers
         $script:form.Add_FormClosing($script:form_FormClosing)
         $script:form.Add_Load($script:form_Load)
         $script:form.Add_Shown($script:form_Shown)
-        
         Write-RepairLog -Message "Form events registered" -Category "SYSTEM"
     }
     catch {
@@ -5278,7 +4565,6 @@ function Register-FormEvents {
     }
 }
 #endregion
-
 #region 15. Application Entry Point and Execution - Main Program Flow
 # Register unhandled exception handler
 try {
@@ -5286,8 +4572,8 @@ try {
         param($exceptionSender, $exceptionEventArgs)
         try {
             $exception = $exceptionEventArgs.ExceptionObject
+            # Move Close-RepairLog AFTER finally block, so don't close here
             Write-RepairLog -Message "Unhandled exception: $($exception.ToString())" -Category "ERROR"
-            
             # Show error to user
             [System.Windows.Forms.MessageBox]::Show(
                 "An unexpected error occurred. The application will close.`n`nError: $($exception.Message)",
@@ -5304,17 +4590,14 @@ try {
 catch {
     Write-Warning "Could not register unhandled exception handler: $($_.Exception.Message)"
 }
-
 # Main application entry point - This must be at the END after all functions are defined
 try {
     Write-RepairLog -Message "=== SYSTEM REPAIR TOOLKIT STARTUP ===" -Category "SYSTEM"
     Write-RepairLog -Message "Application startup initiated" -Category "SYSTEM"
-    
     # Verify OS version
     $osVersion = [System.Environment]::OSVersion.Version
     if ($osVersion.Major -lt 10) {
         Write-RepairLog -Message "Warning: Running on pre-Windows 10 system (Version: $osVersion)" -Category "WARNING"
-        
         $message = "This toolkit is designed for Windows 10/11. Some features may not work correctly on older versions."
         [System.Windows.Forms.MessageBox]::Show(
             $message,
@@ -5323,7 +4606,6 @@ try {
             [System.Windows.Forms.MessageBoxIcon]::Warning
         )
     }
-    
     # Log .NET version
     try {
         $netVersion = [System.Environment]::Version
@@ -5332,26 +4614,20 @@ try {
     catch {
         Write-RepairLog -Message "Could not determine .NET version" -Category "WARNING"
     }
-    
     # Initialize main form - Now this function exists!
     if (-not (Initialize-MainForm)) {
         throw "Failed to initialize main form"
     }
-    
     # Register form events
     Register-FormEvents
-    
     Write-RepairLog -Message "Displaying main application window" -Category "SYSTEM"
-    
     # Show the form
     [void]$script:form.ShowDialog()
-    
     Write-RepairLog -Message "Main window closed by user" -Category "SYSTEM"
 }
 catch {
     $errorMessage = "Critical startup error: $($_.Exception.Message)"
     Write-RepairLog -Message $errorMessage -Category "ERROR"
-    
     try {
         [System.Windows.Forms.MessageBox]::Show(
             "A critical error occurred during startup:`n`n$($_.Exception.Message)`n`n" +
@@ -5368,10 +4644,8 @@ catch {
 finally {
     try {
         Write-RepairLog -Message "Application execution completed - cleanup starting" -Category "SYSTEM"
-        
         # Stop progress timer
         Stop-ProgressTimer
-        
         # Stop all jobs
         try {
             Stop-AllJobs
@@ -5379,7 +4653,6 @@ finally {
         catch {
             Write-RepairLog -Message "Error stopping jobs: $($_.Exception.Message)" -Category "WARNING"
         }
-        
         # Clean up communication files
         try {
             Clear-JobCommunicationFiles
@@ -5387,17 +4660,16 @@ finally {
         catch {
             Write-RepairLog -Message "Error clearing communication files: $($_.Exception.Message)" -Category "WARNING"
         }
-        
         # Dispose timer lock
         try {
             if ($null -ne $script:timerLock) {
-                $script:timerLock.Dispose()
+                # timerLock is now [object], not Mutex, so no Dispose
+                # $script:timerLock.Dispose()  # Removed
             }
         }
         catch {
             Write-RepairLog -Message "Error disposing timer lock: $($_.Exception.Message)" -Category "WARNING"
         }
-        
         # Clear job collection
         try {
             $script:jobCollection.Clear()
@@ -5405,7 +4677,6 @@ finally {
         catch {
             Write-RepairLog -Message "Error clearing job collection: $($_.Exception.Message)" -Category "WARNING"
         }
-        
         # Dispose all tracked objects
         try {
             foreach ($obj in $script:disposedObjects) {
@@ -5423,8 +4694,8 @@ finally {
         catch {
             Write-RepairLog -Message "Error disposing tracked objects: $($_.Exception.Message)" -Category "WARNING"
         }
-        
         Write-RepairLog -Message "=== SYSTEM REPAIR TOOLKIT SESSION END ===" -Category "SYSTEM"
+        # Close log AFTER all other cleanup
         Close-RepairLog
     }
     catch {
